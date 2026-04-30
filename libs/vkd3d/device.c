@@ -3363,8 +3363,8 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
 
     if (!physical_device_info->xfb_properties.transformFeedbackQueries)
     {
-        ERR("Lacking support for transform feedback.\n");
-        return E_INVALIDARG;
+        WARN("Lacking transform feedback (Apple M-series). Continuing.\n");
+        /* fallthrough - soft-fail for macOS DX12 spike */
     }
 
     single_storage_texel =
@@ -3378,8 +3378,10 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
 
     if (!single_storage_texel || !single_uniform_texel)
     {
-        ERR("Lacking support for single texel alignment.\n");
-        return E_INVALIDARG;
+        WARN("Lacking support for single texel alignment (Apple M-series MoltenVK). "
+             "Continuing - texel buffer alignment may produce subtly wrong addresses "
+             "for some D3D12 SRVs/UAVs.\n");
+        /* fallthrough - soft-fail for macOS DX12 spike */
     }
 
     /* Disable unused Vulkan features. The following features need to remain enabled
@@ -3501,14 +3503,14 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
     if (!physical_device_info->robustness2_features.robustBufferAccess2 ||
             !physical_device_info->robustness2_features.robustImageAccess2)
     {
-        ERR("Robustness2 features not supported. This is required.\n");
-        return E_INVALIDARG;
+        WARN("Robustness2 features not supported (Apple M-series). Continuing - out-of-bounds reads will return garbage instead of zeros.\n");
+        /* fallthrough - soft-fail for macOS DX12 spike */
     }
 
     if (!physical_device_info->robustness2_features.nullDescriptor)
     {
-        ERR("Null descriptor in VK_EXT_robustness2 is not supported by this implementation. This is required for correct operation.\n");
-        return E_INVALIDARG;
+        WARN("Null descriptor in VK_EXT_robustness2 not supported (Apple M-series). Continuing - null SRV/UAV reads may crash instead of returning zeros.\n");
+        /* fallthrough - soft-fail for macOS DX12 spike */
     }
 
     if (vulkan_info->KHR_fragment_shading_rate)
