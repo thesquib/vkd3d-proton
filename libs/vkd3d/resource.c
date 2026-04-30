@@ -3296,18 +3296,29 @@ HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc,
             if (desc->Alignment != 0 && desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
             {
                 /* Microsoft's D3D12 runtime treats Alignment as a minimum and
-                 * silently rounds smaller values up to
-                 * D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT (64 KiB) for
-                 * buffers. vkd3d-proton historically rejected anything not
-                 * exactly 0 or 64 KiB, breaking games that pass smaller
-                 * alignments (Elden Ring passes 4096 -> game derefs NULL on
-                 * the returned E_INVALIDARG). Round up rather than reject;
-                 * over-aligned buffers are spec-conformant and have no
-                 * functional consequence. Cross-cutting fix for any DX12 game
-                 * with this allocator pattern. */
-                WARN("Buffer Alignment %"PRIu64" is below D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; rounding up.\n",
+                 * silently accepts smaller values for buffers; the actual
+                 * placement still happens on the underlying allocator's
+                 * granularity. vkd3d-proton historically rejected anything
+                 * not exactly 0 or 64 KiB, breaking games that pass smaller
+                 * alignments (Elden Ring passes 4096).
+                 *
+                 * Earlier attempt: modify desc->Alignment in-place to
+                 * D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT. That broke the
+                 * GetResourceAllocationInfo3 path where the caller expects
+                 * to see its requested alignment reflected back, so the
+                 * game's check-then-fallback alignment-probing crashed.
+                 *
+                 * Better: accept-as-is. Don't mutate the desc. Buffer
+                 * allocation paths internally place buffers at the heap's
+                 * own granularity (always >= 64 KiB on Vulkan); the smaller
+                 * desc->Alignment is just informational from the game's
+                 * point of view.
+                 *
+                 * Cross-cutting fix for any DX12 game using non-default
+                 * buffer alignments. */
+                WARN("Buffer Alignment %"PRIu64" non-default; accepting (allocator granularity is >= 64 KiB regardless).\n",
                         desc->Alignment);
-                ((D3D12_RESOURCE_DESC1 *)desc)->Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+                /* Fall through with desc unchanged. */
             }
 
             if (desc->Format != DXGI_FORMAT_UNKNOWN || desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR
