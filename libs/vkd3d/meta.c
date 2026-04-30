@@ -1827,19 +1827,29 @@ static HRESULT vkd3d_dstorage_ops_init(struct vkd3d_dstorage_ops *dstorage_ops, 
             &dstorage_ops->vk_dstorage_layout)))
         return hresult_from_vk_result(vr);
 
-    if ((vr = vkd3d_meta_create_compute_pipeline(device,
-            sizeof(cs_emit_nv_memory_decompression_regions),
-            cs_emit_nv_memory_decompression_regions,
-            dstorage_ops->vk_dstorage_layout,
-            NULL, false, NULL, &dstorage_ops->vk_emit_nv_memory_decompression_regions_pipeline)))
-        return hresult_from_vk_result(vr);
+    /* The cs_emit_nv_memory_decompression_{regions,workgroups} shaders are only used
+     * when the device supports VK_NV_memory_decompression (NVIDIA hardware). On other
+     * drivers (e.g. MoltenVK on Apple Silicon) they are not just unused, they fail to
+     * compile because they perform `atomicAdd(uvec3.x)` which SPIRV-Cross translates
+     * to `&vec.x` in MSL, which Metal forbids ("address of vector element requested").
+     * Skip pipeline creation when NV memory decompression is unavailable; the GDeflate
+     * fallback path below covers DirectStorage support on those drivers. */
+    if (d3d12_device_use_nv_memory_decompression(device))
+    {
+        if ((vr = vkd3d_meta_create_compute_pipeline(device,
+                sizeof(cs_emit_nv_memory_decompression_regions),
+                cs_emit_nv_memory_decompression_regions,
+                dstorage_ops->vk_dstorage_layout,
+                NULL, false, NULL, &dstorage_ops->vk_emit_nv_memory_decompression_regions_pipeline)))
+            return hresult_from_vk_result(vr);
 
-    if ((vr = vkd3d_meta_create_compute_pipeline(device,
-            sizeof(cs_emit_nv_memory_decompression_workgroups),
-            cs_emit_nv_memory_decompression_workgroups,
-            dstorage_ops->vk_dstorage_layout,
-            NULL, false, NULL, &dstorage_ops->vk_emit_nv_memory_decompression_workgroups_pipeline)))
-        return hresult_from_vk_result(vr);
+        if ((vr = vkd3d_meta_create_compute_pipeline(device,
+                sizeof(cs_emit_nv_memory_decompression_workgroups),
+                cs_emit_nv_memory_decompression_workgroups,
+                dstorage_ops->vk_dstorage_layout,
+                NULL, false, NULL, &dstorage_ops->vk_emit_nv_memory_decompression_workgroups_pipeline)))
+            return hresult_from_vk_result(vr);
+    }
 
     if (!d3d12_device_use_nv_memory_decompression(device) &&
             device->device_info.vulkan_1_2_features.storageBuffer8BitAccess &&
