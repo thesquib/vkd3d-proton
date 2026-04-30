@@ -3344,7 +3344,30 @@ HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc,
                 return E_INVALIDARG;
             }
 
-            if (!d3d12_resource_validate_buffer_alignment(desc))
+            /* proton-mac: accept a non-default buffer Alignment instead of
+             * rejecting it. Microsoft's runtime treats Alignment as a minimum
+             * and silently accepts smaller values for buffers; vkd3d-proton
+             * rejected anything not exactly 0 or 64 KiB, and Elden Ring passes
+             * 4096 and never checks the HRESULT, so it derefs a NULL resource.
+             *
+             * ⚠ Do NOT mutate desc->Alignment up to the default. That was
+             * tried and it broke d3d12_device_GetResourceAllocationInfo3,
+             * where the caller expects its requested alignment reflected back
+             * and the check-then-fallback probing loop then crashed. Accept
+             * as-is; the allocator places buffers at the heap's own
+             * granularity (>= 64 KiB on Vulkan) regardless.
+             *
+             * Upstream's validator is left byte-identical so it keeps
+             * rebasing cleanly, and it still runs for USE_TIGHT_ALIGNMENT,
+             * where 8..256 is meaningful and out-of-range really is invalid. */
+            if (!(desc->Flags & D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT) &&
+                    desc->Alignment != 0 &&
+                    desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+            {
+                WARN("Buffer Alignment %"PRIu64" non-default; accepting (allocator granularity is >= 64 KiB regardless).\n",
+                        desc->Alignment);
+            }
+            else if (!d3d12_resource_validate_buffer_alignment(desc))
                 return E_INVALIDARG;
 
             if (desc->Format != DXGI_FORMAT_UNKNOWN || desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR
