@@ -1475,6 +1475,14 @@ HRESULT hresult_from_vk_result(VkResult vr)
         case VK_ERROR_VALIDATION_FAILED_EXT:
             /* NV driver sometimes returns this on invalid API usage. */
             return E_INVALIDARG;
+        case VK_ERROR_FEATURE_NOT_PRESENT:
+            /* Apple M-series MoltenVK lacks several optional Vulkan features
+             * (transform feedback, pipelineStatisticsQuery, etc.). Map to
+             * E_NOTIMPL so callers can recover gracefully (return a stub
+             * object) instead of leaving an uninitialized pointer that the
+             * game then null-derefs. */
+            WARN("VK_ERROR_FEATURE_NOT_PRESENT - likely Apple M-series MoltenVK gap.\n");
+            return E_NOTIMPL;
         default:
             FIXME("Unhandled VkResult %d.\n", vr);
             /* fall-through */
