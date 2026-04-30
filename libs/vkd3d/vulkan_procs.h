@@ -382,7 +382,7 @@ VK_DEVICE_EXT_PFN(vkGetLatencyTimingsNV)
 VK_DEVICE_EXT_PFN(vkQueueNotifyOutOfBandNV)
 
 /* VK_KHR_cooperative_matrix */
-VK_INSTANCE_PFN(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+VK_INSTANCE_EXT_PFN(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
 
 /* VK_EXT_opacity_micromap */
 VK_DEVICE_EXT_PFN(vkGetMicromapBuildSizesEXT)
