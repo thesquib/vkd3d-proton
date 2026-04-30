@@ -10769,7 +10769,20 @@ HRESULT d3d12_query_heap_create(struct d3d12_device *device, const D3D12_QUERY_H
                 return E_INVALIDARG;
         }
 
-        if ((vr = VK_CALL(vkCreateQueryPool(device->vk_device, &pool_info, NULL, &object->vk_query_pool))) < 0)
+        /* Apple M-series MoltenVK lacks pipelineStatisticsQuery - the host
+         * call would return VK_ERROR_FEATURE_NOT_PRESENT and crash the
+         * game (Elden Ring null-derefs the missing heap). Skip the call
+         * upfront and return a stub heap; query reads will read zeroes
+         * via vkCmdResetQueryPool/vkCmdCopyQueryPoolResults guards in
+         * d3d12_command_list. */
+        if (desc->Type == D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS &&
+            !device->device_info.features2.features.pipelineStatisticsQuery)
+        {
+            WARN("Host lacks pipelineStatisticsQuery (typical on Apple M-series). "
+                 "Returning stub query heap; pipeline-statistics reads will be zero.\n");
+            object->vk_query_pool = VK_NULL_HANDLE;
+        }
+        else if ((vr = VK_CALL(vkCreateQueryPool(device->vk_device, &pool_info, NULL, &object->vk_query_pool))) < 0)
         {
             WARN("Failed to create Vulkan query pool, vr %d.\n", vr);
             vkd3d_free(object);
