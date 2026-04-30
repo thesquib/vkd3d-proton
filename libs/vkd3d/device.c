@@ -9112,12 +9112,31 @@ static D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE d3d12_device_GetResourc
 
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         {
-            resource_info.SizeInBytes = desc->Width;
-
-            if (desc->Flags & D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT)
-                resource_info.Alignment = VKD3D_MIN_BUFFER_ALIGNMENT;
+            /* proton-darwin 2026-05-01: Microsoft's D3D12 runtime returns
+             * Alignment matching the caller's requested non-default value
+             * (e.g. 4096) and SizeInBytes rounded up to that alignment.
+             * Returning Alignment=64K + SizeInBytes=Width for every probe
+             * breaks games that probe alignments via repeated
+             * GetResourceAllocationInfo calls and expect different results
+             * for different requested alignments. Elden Ring's resource-
+             * allocator init does exactly this and crashes at +0x1EB9989
+             * when both probes return identical values. */
+            uint64_t requested_align;
+            if (desc->Alignment != 0 && desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+                requested_align = desc->Alignment;
+            else if (desc->Flags & D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT)
+                requested_align = VKD3D_MIN_BUFFER_ALIGNMENT;
             else
-                resource_info.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+                requested_align = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+
+            /* SizeInBytes = AlignUp(Width, requested_align). Mirrors MS
+             * runtime semantics. */
+            if (requested_align > 1)
+                resource_info.SizeInBytes =
+                    (desc->Width + requested_align - 1) & ~(requested_align - 1);
+            else
+                resource_info.SizeInBytes = desc->Width;
+            resource_info.Alignment = requested_align;
         }
         else
         {
