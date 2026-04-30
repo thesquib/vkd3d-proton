@@ -157,11 +157,12 @@ static bool vkd3d_check_meta_command_support(struct d3d12_device *device, REFGUI
 {
     if (!memcmp(command_id, &IID_META_COMMAND_DSTORAGE, sizeof(*command_id)))
     {
-        if (!device->meta_ops.dstorage.vk_emit_nv_memory_decompression_regions_pipeline)
-            return false;
+        /* DStorage is supported either via the NV_memory_decompression hardware path
+         * (which requires the regions pipeline) or via the GDeflate compute fallback. */
+        if (d3d12_device_use_nv_memory_decompression(device))
+            return device->meta_ops.dstorage.vk_emit_nv_memory_decompression_regions_pipeline != VK_NULL_HANDLE;
 
-        return d3d12_device_use_nv_memory_decompression(device) ||
-                device->meta_ops.dstorage.vk_gdeflate_pipeline;
+        return device->meta_ops.dstorage.vk_gdeflate_pipeline != VK_NULL_HANDLE;
     }
 
     return false;
