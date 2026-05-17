@@ -6516,6 +6516,28 @@ void d3d12_command_list_decay_tracked_state(struct d3d12_command_list *list)
     d3d12_command_list_flush_subresource_updates(list);
 }
 
+/* [DRAW-TRACE] KCD2 menu-render isolation diagnostic.
+ *
+ * Enabled by env var VKD3D_TRACE_DRAW=1 (cached singleton). Emits one INFO
+ * line per ID3D12CommandQueue::ExecuteCommandLists call, and one INFO line
+ * per command list Close summarising the number of Draw/DrawIndexed/Dispatch
+ * calls recorded into that list. Per-draw incrementing uses
+ * vkd3d_atomic_uint32_increment so callers do not need to be single-threaded.
+ * Grep with "[DRAW-TRACE]".
+ *
+ * Lives on the "proton-mac-checkfeature-trace" branch alongside the
+ * [CKF-TRACE] instrumentation. Safe to leave compiled in - all runtime cost
+ * is gated on the env var being set (one cached int load + branch on the hot
+ * path; the atomic increment only fires when tracing is enabled).
+ */
+static bool vkd3d_trace_draw_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+        cached = vkd3d_env_var_as_uint("VKD3D_TRACE_DRAW", 0) ? 1 : 0;
+    return cached != 0;
+}
+
 static HRESULT STDMETHODCALLTYPE d3d12_command_list_Close(d3d12_command_list_iface *iface)
 {
     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
@@ -6524,6 +6546,14 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_Close(d3d12_command_list_ifa
     HRESULT hr;
 
     TRACE("iface %p.\n", iface);
+
+    if (vkd3d_trace_draw_enabled())
+    {
+        INFO("[DRAW-TRACE] cmdlist closed list=%p type=%u draws=%u dispatches=%u pid=%lu tid=%lu\n",
+                list, (unsigned)list->type, list->draw_count_trace, list->dispatch_count_trace,
+                (unsigned long)GetCurrentProcessId(),
+                (unsigned long)GetCurrentThreadId());
+    }
 
     if (!list->is_recording)
     {
@@ -6886,6 +6916,10 @@ static void d3d12_command_list_reset_internal_state(struct d3d12_command_list *l
     list->query_resolve_count = 0;
     list->submit_allocator = NULL;
     list->dgc_batch.draws_count = 0;
+
+    /* [DRAW-TRACE] reset diagnostic counters when the list is reset for reuse. */
+    list->draw_count_trace = 0;
+    list->dispatch_count_trace = 0;
 
     for (i = 0; i < list->retained_resources_count; i++)
         d3d12_resource_decref_weak(list->retained_resources[i]);
@@ -8555,6 +8589,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_lis
             iface, vertex_count_per_instance, instance_count,
             start_vertex_location, start_instance_location);
 
+    /* [DRAW-TRACE] count this draw against the recording command list. */
+    if (vkd3d_trace_draw_enabled())
+        vkd3d_atomic_uint32_increment(&list->draw_count_trace, vkd3d_memory_order_relaxed);
+
     d3d12_command_list_flush_dgc_batch(list);
 
     if (list->predication.fallback_enabled)
@@ -8639,6 +8677,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
             "base_vertex_location %d, start_instance_location %u.\n",
             iface, index_count_per_instance, instance_count, start_vertex_location,
             base_vertex_location, start_instance_location);
+
+    /* [DRAW-TRACE] count this draw against the recording command list. */
+    if (vkd3d_trace_draw_enabled())
+        vkd3d_atomic_uint32_increment(&list->draw_count_trace, vkd3d_memory_order_relaxed);
 
     d3d12_command_list_flush_dgc_batch(list);
 
@@ -8805,6 +8847,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
     const VkPhysicalDeviceLimits *limits;
 
     TRACE("iface %p, x %u, y %u, z %u.\n", iface, x, y, z);
+
+    /* [DRAW-TRACE] count this dispatch against the recording command list. */
+    if (vkd3d_trace_draw_enabled())
+        vkd3d_atomic_uint32_increment(&list->dispatch_count_trace, vkd3d_memory_order_relaxed);
 
     d3d12_command_list_check_render_pass_validation(list, "Dispatch called within a render pass.\n", true);
     d3d12_command_list_flush_dgc_batch(list);
@@ -21588,6 +21634,14 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
 
     TRACE("iface %p, command_list_count %u, command_lists %p.\n",
             iface, command_list_count, command_lists);
+
+    if (vkd3d_trace_draw_enabled())
+    {
+        INFO("[DRAW-TRACE] ExecuteCommandLists queue=%p NumCommandLists=%u pid=%lu tid=%lu\n",
+                command_queue, command_list_count,
+                (unsigned long)GetCurrentProcessId(),
+                (unsigned long)GetCurrentThreadId());
+    }
 
     if (!command_list_count)
         return;

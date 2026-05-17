@@ -3324,6 +3324,14 @@ struct d3d12_command_list
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
 
+    /* [DRAW-TRACE] KCD2 menu-render isolation. Cleared in
+     * d3d12_command_list_reset_internal_state, summarised by Close when
+     * VKD3D_TRACE_DRAW=1. Per-draw/per-dispatch increment uses
+     * vkd3d_atomic_uint32_increment so it is safe to bump from any thread,
+     * though in practice a command list is recorded by a single thread. */
+    uint32_t draw_count_trace;
+    uint32_t dispatch_count_trace;
+
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     unsigned int breadcrumb_context_index;
 #endif
