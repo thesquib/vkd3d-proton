@@ -5228,7 +5228,102 @@ static HRESULT d3d12_device_get_format_support(struct d3d12_device *device, D3D1
     return S_OK;
 }
 
-static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_iface *iface,
+/* [CKF-TRACE] KCD2 PSO-list-empty diagnostic.
+ *
+ * Enabled by env var VKD3D_TRACE_CHECKFEATURE=1 (cached singleton). Emits one
+ * INFO line per CheckFeatureSupport() call with feature enum + buffer size +
+ * caller pid/tid, plus a per-feature decoded INFO line for the high-value
+ * structures (D3D12_OPTIONS, OPTIONSn, SHADER_MODEL, FEATURE_LEVELS,
+ * ROOT_SIGNATURE, FORMAT_SUPPORT). Grep with "[CKF-TRACE]".
+ *
+ * Lives on the "proton-mac-checkfeature-trace" branch so it can be reverted
+ * independently of the vendor-spoof patch. Safe to leave compiled in - all
+ * runtime cost is gated on the env var being set.
+ */
+static bool vkd3d_checkfeature_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+        cached = vkd3d_env_var_as_uint("VKD3D_TRACE_CHECKFEATURE", 0) ? 1 : 0;
+    return cached != 0;
+}
+
+static const char *vkd3d_d3d12_feature_to_str(D3D12_FEATURE f)
+{
+    switch (f)
+    {
+        case D3D12_FEATURE_D3D12_OPTIONS:                  return "D3D12_OPTIONS";
+        case D3D12_FEATURE_ARCHITECTURE:                   return "ARCHITECTURE";
+        case D3D12_FEATURE_FEATURE_LEVELS:                 return "FEATURE_LEVELS";
+        case D3D12_FEATURE_FORMAT_SUPPORT:                 return "FORMAT_SUPPORT";
+        case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS:     return "MULTISAMPLE_QUALITY_LEVELS";
+        case D3D12_FEATURE_FORMAT_INFO:                    return "FORMAT_INFO";
+        case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT:    return "GPU_VIRTUAL_ADDRESS_SUPPORT";
+        case D3D12_FEATURE_SHADER_MODEL:                   return "SHADER_MODEL";
+        case D3D12_FEATURE_D3D12_OPTIONS1:                 return "D3D12_OPTIONS1";
+        case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT: return "PROTECTED_RESOURCE_SESSION_SUPPORT";
+        case D3D12_FEATURE_ROOT_SIGNATURE:                 return "ROOT_SIGNATURE";
+        case D3D12_FEATURE_ARCHITECTURE1:                  return "ARCHITECTURE1";
+        case D3D12_FEATURE_D3D12_OPTIONS2:                 return "D3D12_OPTIONS2";
+        case D3D12_FEATURE_SHADER_CACHE:                   return "SHADER_CACHE";
+        case D3D12_FEATURE_COMMAND_QUEUE_PRIORITY:         return "COMMAND_QUEUE_PRIORITY";
+        case D3D12_FEATURE_D3D12_OPTIONS3:                 return "D3D12_OPTIONS3";
+        case D3D12_FEATURE_EXISTING_HEAPS:                 return "EXISTING_HEAPS";
+        case D3D12_FEATURE_D3D12_OPTIONS4:                 return "D3D12_OPTIONS4";
+        case D3D12_FEATURE_SERIALIZATION:                  return "SERIALIZATION";
+        case D3D12_FEATURE_CROSS_NODE:                     return "CROSS_NODE";
+        case D3D12_FEATURE_D3D12_OPTIONS5:                 return "D3D12_OPTIONS5";
+        case D3D12_FEATURE_D3D12_OPTIONS6:                 return "D3D12_OPTIONS6";
+        case D3D12_FEATURE_D3D12_OPTIONS7:                 return "D3D12_OPTIONS7";
+        case D3D12_FEATURE_D3D12_OPTIONS8:                 return "D3D12_OPTIONS8";
+        case D3D12_FEATURE_D3D12_OPTIONS9:                 return "D3D12_OPTIONS9";
+        case D3D12_FEATURE_D3D12_OPTIONS10:                return "D3D12_OPTIONS10";
+        case D3D12_FEATURE_D3D12_OPTIONS11:                return "D3D12_OPTIONS11";
+        case D3D12_FEATURE_D3D12_OPTIONS12:                return "D3D12_OPTIONS12";
+        case D3D12_FEATURE_D3D12_OPTIONS13:                return "D3D12_OPTIONS13";
+        case D3D12_FEATURE_D3D12_OPTIONS14:                return "D3D12_OPTIONS14";
+        case D3D12_FEATURE_D3D12_OPTIONS15:                return "D3D12_OPTIONS15";
+        case D3D12_FEATURE_D3D12_OPTIONS16:                return "D3D12_OPTIONS16";
+        case D3D12_FEATURE_D3D12_OPTIONS17:                return "D3D12_OPTIONS17";
+        case D3D12_FEATURE_D3D12_OPTIONS18:                return "D3D12_OPTIONS18";
+        case D3D12_FEATURE_D3D12_OPTIONS19:                return "D3D12_OPTIONS19";
+        case D3D12_FEATURE_D3D12_OPTIONS20:                return "D3D12_OPTIONS20";
+        case D3D12_FEATURE_D3D12_OPTIONS21:                return "D3D12_OPTIONS21";
+        case D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT:          return "D3D12_TIGHT_ALIGNMENT";
+        case D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE: return "APPLICATION_SPECIFIC_DRIVER_STATE";
+        case D3D12_FEATURE_QUERY_META_COMMAND:             return "QUERY_META_COMMAND";
+        default:                                            return "UNKNOWN";
+    }
+}
+
+#define VKD3D_CKF_TRACE_DECODED(fmt, ...) \
+    do { \
+        if (vkd3d_checkfeature_trace_enabled()) \
+            INFO("[CKF-TRACE] decoded feature=%#x (%s) " fmt, \
+                    feature, vkd3d_d3d12_feature_to_str(feature), ##__VA_ARGS__); \
+    } while (0)
+
+/* Hex-dump up to 64 bytes of arbitrary struct payload for the long tail of
+ * OPTIONSn structures we don't field-decode individually. Cheap; called only
+ * when VKD3D_TRACE_CHECKFEATURE=1. */
+static void vkd3d_ckf_dump_hex(D3D12_FEATURE feature, const void *data, UINT size)
+{
+    char buf[3 * 64 + 1];
+    UINT i, n = size < 64 ? size : 64;
+    const unsigned char *p = data;
+
+    if (!vkd3d_checkfeature_trace_enabled())
+        return;
+
+    for (i = 0; i < n; ++i)
+        snprintf(buf + i * 3, sizeof(buf) - i * 3, "%02x ", p[i]);
+    buf[i ? i * 3 - 1 : 0] = '\0';
+
+    INFO("[CKF-TRACE] hex feature=%#x (%s) size=%u first%u=[%s]\n",
+            feature, vkd3d_d3d12_feature_to_str(feature), size, n, buf);
+}
+
+static HRESULT d3d12_device_CheckFeatureSupport_inner(d3d12_device_iface *iface,
         D3D12_FEATURE feature, void *feature_data, UINT feature_data_size)
 {
     struct d3d12_device *device = impl_from_ID3D12Device(iface);
@@ -5266,6 +5361,17 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
             TRACE("VP and RT array index from any shader without GS emulation %#x.\n",
                     data->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation);
             TRACE("Resource heap tier %#x.\n", data->ResourceHeapTier);
+            VKD3D_CKF_TRACE_DECODED("DoubleFP=%u OutMergerLogicOp=%u MinPrec=%#x TiledTier=%u RBTier=%u "
+                    "PSStencilRef=%u TypedUAVLoadAddl=%u ROVs=%u ConsRastTier=%u GPUVABits=%u "
+                    "Swizzle64K=%u CrossNodeTier=%u CrossAdapterRowMajor=%u VPRTArrayNoGS=%u HeapTier=%u\n",
+                    data->DoublePrecisionFloatShaderOps, data->OutputMergerLogicOp,
+                    data->MinPrecisionSupport, data->TiledResourcesTier, data->ResourceBindingTier,
+                    data->PSSpecifiedStencilRefSupported, data->TypedUAVLoadAdditionalFormats,
+                    data->ROVsSupported, data->ConservativeRasterizationTier,
+                    data->MaxGPUVirtualAddressBitsPerResource, data->StandardSwizzle64KBSupported,
+                    data->CrossNodeSharingTier, data->CrossAdapterRowMajorTextureSupported,
+                    data->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation,
+                    data->ResourceHeapTier);
             return S_OK;
         }
 
@@ -5320,6 +5426,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
             }
 
             TRACE("Max supported feature level %#x.\n", data->MaxSupportedFeatureLevel);
+            VKD3D_CKF_TRACE_DECODED("NumFeatureLevels=%u MaxSupported=%#x (cap max=%#x)\n",
+                    data->NumFeatureLevels, data->MaxSupportedFeatureLevel,
+                    caps->max_feature_level);
             return S_OK;
         }
 
@@ -5340,6 +5449,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
             vkd3d_determine_format_support_for_feature_level(device, data);
 
             TRACE("Format %#x, support1 %#x, support2 %#x.\n", data->Format, data->Support1, data->Support2);
+            VKD3D_CKF_TRACE_DECODED("Format=%#x Support1=%#x Support2=%#x\n",
+                    data->Format, data->Support1, data->Support2);
             return S_OK;
         }
 
@@ -5416,9 +5527,14 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
                 return E_INVALIDARG;
             }
 
-            TRACE("Request shader model %#x.\n", data->HighestShaderModel);
-            data->HighestShaderModel = min(data->HighestShaderModel, device->d3d12_caps.max_shader_model);
-            TRACE("Shader model %#x.\n", data->HighestShaderModel);
+            {
+                D3D_SHADER_MODEL requested = data->HighestShaderModel;
+                TRACE("Request shader model %#x.\n", data->HighestShaderModel);
+                data->HighestShaderModel = min(data->HighestShaderModel, device->d3d12_caps.max_shader_model);
+                TRACE("Shader model %#x.\n", data->HighestShaderModel);
+                VKD3D_CKF_TRACE_DECODED("Requested=%#x Granted=%#x (cap=%#x)\n",
+                        requested, data->HighestShaderModel, device->d3d12_caps.max_shader_model);
+            }
             return S_OK;
         }
 
@@ -5481,9 +5597,13 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
             }
 
             TRACE("Root signature requested %#x.\n", data->HighestVersion);
-            data->HighestVersion = min(data->HighestVersion, D3D_ROOT_SIGNATURE_VERSION_1_2);
-
-            TRACE("Root signature version %#x.\n", data->HighestVersion);
+            {
+                D3D_ROOT_SIGNATURE_VERSION requested = data->HighestVersion;
+                data->HighestVersion = min(data->HighestVersion, D3D_ROOT_SIGNATURE_VERSION_1_2);
+                TRACE("Root signature version %#x.\n", data->HighestVersion);
+                VKD3D_CKF_TRACE_DECODED("Requested=%#x Granted=%#x (cap=%#x)\n",
+                        requested, data->HighestVersion, D3D_ROOT_SIGNATURE_VERSION_1_2);
+            }
             return S_OK;
         }
 
@@ -6090,6 +6210,52 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
             FIXME("Unhandled feature %#x.\n", feature);
             return E_NOTIMPL;
     }
+}
+
+static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_iface *iface,
+        D3D12_FEATURE feature, void *feature_data, UINT feature_data_size)
+{
+    HRESULT hr;
+
+    if (vkd3d_checkfeature_trace_enabled())
+    {
+        INFO("[CKF-TRACE] call feature=%#x (%s) size=%u pid=%lu tid=%lu\n",
+                feature, vkd3d_d3d12_feature_to_str(feature), feature_data_size,
+                (unsigned long)GetCurrentProcessId(),
+                (unsigned long)GetCurrentThreadId());
+    }
+
+    hr = d3d12_device_CheckFeatureSupport_inner(iface, feature, feature_data, feature_data_size);
+
+    if (vkd3d_checkfeature_trace_enabled())
+    {
+        /* Per-feature decoded INFO lines (where present) were emitted inside the
+         * switch via VKD3D_CKF_TRACE_DECODED. Additionally, for any feature whose
+         * struct we don't field-decode, dump up to 64 bytes of the returned
+         * payload as hex so we can spot per-tier knobs that KCD2 may be gating
+         * its PSO list build on. Only emit if the call succeeded - on
+         * E_INVALIDARG/E_NOTIMPL the buffer contents are undefined. */
+        if (SUCCEEDED(hr) && feature_data && feature_data_size)
+        {
+            switch (feature)
+            {
+                /* Already field-decoded above; skip the hex tail. */
+                case D3D12_FEATURE_D3D12_OPTIONS:
+                case D3D12_FEATURE_FEATURE_LEVELS:
+                case D3D12_FEATURE_FORMAT_SUPPORT:
+                case D3D12_FEATURE_SHADER_MODEL:
+                case D3D12_FEATURE_ROOT_SIGNATURE:
+                    break;
+                default:
+                    vkd3d_ckf_dump_hex(feature, feature_data, feature_data_size);
+                    break;
+            }
+        }
+        INFO("[CKF-TRACE] return feature=%#x (%s) hr=%#x\n",
+                feature, vkd3d_d3d12_feature_to_str(feature), (unsigned int)hr);
+    }
+
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_CreateDescriptorHeap(d3d12_device_iface *iface,
