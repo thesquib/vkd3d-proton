@@ -216,6 +216,16 @@ commas or semicolons.
  - `VKD3D_VULKAN_DEVICE` - a zero-based device index. Use to force the selected
    Vulkan device.
  - `VKD3D_FILTER_DEVICE_NAME` - skips devices that don't include this substring.
+ - `VKD3D_FORCE_INITIAL_VENDOR_ID` - if set to a non-zero value (decimal or
+   `0x`-prefixed hex), overrides the VendorId reported by
+   `vkGetPhysicalDeviceProperties2`. Useful on layered Vulkan stacks such as
+   MoltenVK on Apple Silicon (where the host adapter reports `0x106B`) when an
+   application's precompiled shader cache is keyed on a hardware-vendor PCI ID.
+   Does NOT alter `IDXGIAdapter::GetDesc().VendorId`; for that, also set
+   `DXVK_CONFIG="dxgi.customVendorId = <id>"`.
+ - `VKD3D_FORCE_INITIAL_DEVICE_ID` - companion to
+   `VKD3D_FORCE_INITIAL_VENDOR_ID`. Overrides the DeviceId reported by
+   `vkGetPhysicalDeviceProperties2`. Same DXGI caveat applies.
  - `VKD3D_DISABLE_EXTENSIONS` - a list of Vulkan extensions that vkd3d-proton should
    not use even if available.
  - `VKD3D_TEST_DEBUG` - enables additional debug messages in tests. Set to 0, 1
