@@ -2749,6 +2749,41 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
         /* swizzle the underlying driver ID here so everything else will use it */
         info->vulkan_1_2_properties.driverID = real_driver_props.driverID;
     }
+
+    /* Optional VendorId/DeviceId override (VKD3D_FORCE_INITIAL_VENDOR_ID /
+     * VKD3D_FORCE_INITIAL_DEVICE_ID). Useful on layered Vulkan stacks like
+     * MoltenVK on Apple Silicon where the host adapter reports vendor
+     * 0x106B and an application's precompiled shader cache keyed on
+     * AMD/NVIDIA/Intel vendor IDs would otherwise be rejected. The
+     * override is applied AFTER vkGetPhysicalDeviceProperties2 so the
+     * value flows into every consumer reading from
+     * device->device_info.properties2.properties (notably cache.c pipeline
+     * library header writes/checks).
+     *
+     * Note this does NOT alter what IDXGIAdapter::GetDesc() returns to the
+     * application - that vendor ID is set by DXVK's dxgi.dll via
+     * dxgi.customVendorId. For full vendor spoofing both knobs must agree.
+     */
+    {
+        unsigned int forced_vendor;
+        unsigned int forced_device;
+
+        forced_vendor = vkd3d_env_var_as_uint("VKD3D_FORCE_INITIAL_VENDOR_ID", 0);
+        if (forced_vendor)
+        {
+            INFO("VKD3D_FORCE_INITIAL_VENDOR_ID: overriding adapter vendorID %#x -> %#x.\n",
+                    info->properties2.properties.vendorID, forced_vendor);
+            info->properties2.properties.vendorID = forced_vendor;
+        }
+
+        forced_device = vkd3d_env_var_as_uint("VKD3D_FORCE_INITIAL_DEVICE_ID", 0);
+        if (forced_device)
+        {
+            INFO("VKD3D_FORCE_INITIAL_DEVICE_ID: overriding adapter deviceID %#x -> %#x.\n",
+                    info->properties2.properties.deviceID, forced_device);
+            info->properties2.properties.deviceID = forced_device;
+        }
+    }
 }
 
 static void vkd3d_trace_physical_device_properties(const VkPhysicalDeviceProperties *properties)
