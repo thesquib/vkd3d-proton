@@ -4881,6 +4881,7 @@ static void d3d12_device_destroy(struct d3d12_device *device)
     vkd3d_sampler_state_cleanup(&device->sampler_state, device);
     vkd3d_view_map_destroy(&device->sampler_map.map, device);
     vkd3d_meta_ops_cleanup(&device->meta_ops, device);
+    vkd3d_null_srv_fallback_cleanup(&device->null_srv_fallback, device);
     vkd3d_bindless_state_cleanup(&device->bindless_state, device);
     d3d12_device_destroy_vkd3d_queues(device);
     VK_CALL(vkDestroySemaphore(device->vk_device, device->sparse_init_timeline, NULL));
@@ -11583,6 +11584,20 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
     if (FAILED(hr = vkd3d_bindless_state_init(&device->bindless_state, device)))
         goto out_cleanup_global_descriptor_buffer;
 
+    /* Optional Texture3D null-SRV fallback. Gated by
+     * VKD3D_CONFIG=relaxed_unmapped_srv. Init AFTER bindless_state so the
+     * fallback's reserved set slot doesn't collide with bindless sets.
+     * Non-fatal: if init fails, fallback marks itself inactive and the
+     * shader-side opt-in path no-ops. */
+    if (VKD3D_CONFIG_FLAG_IS_SET(RELAXED_UNMAPPED_SRV))
+    {
+        if (FAILED(hr = vkd3d_null_srv_fallback_init(&device->null_srv_fallback, device)))
+        {
+            ERR("[NULL-SRV-FALLBACK] init failed (hr=0x%x), disabling.\n", hr);
+            memset(&device->null_srv_fallback, 0, sizeof(device->null_srv_fallback));
+        }
+    }
+
     if (FAILED(hr = vkd3d_view_map_init(&device->sampler_map.map)))
         goto out_cleanup_bindless_state;
 
@@ -11685,6 +11700,7 @@ out_cleanup_sampler_state:
     vkd3d_sampler_state_cleanup(&device->sampler_state, device);
 out_cleanup_view_map:
     vkd3d_view_map_destroy(&device->sampler_map.map, device);
+    vkd3d_null_srv_fallback_cleanup(&device->null_srv_fallback, device);
 out_cleanup_bindless_state:
     vkd3d_bindless_state_cleanup(&device->bindless_state, device);
 out_cleanup_global_descriptor_buffer:
@@ -12187,4 +12203,306 @@ struct vkd3d_instance *vkd3d_instance_from_device(ID3D12Device *device)
     struct d3d12_device *d3d12_device = impl_from_ID3D12Device((d3d12_device_iface *)device);
 
     return d3d12_device->vkd3d_instance;
+}
+
+/* [NULL-SRV-FALLBACK] device-level zero-filled Texture3D + dedicated descriptor
+ * set. Used by dxil_srv_remap when the normal binding lookup fails and the
+ * caller opted in via VKD3D_CONFIG_FLAG_RELAXED_UNMAPPED_SRV. */
+HRESULT vkd3d_null_srv_fallback_init(struct vkd3d_null_srv_fallback *fb,
+        struct d3d12_device *device)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    VkDescriptorSetLayoutBinding set_bindings[2];
+    VkDescriptorSetLayoutCreateInfo set_layout_info;
+    VkDescriptorPoolCreateInfo pool_info;
+    VkDescriptorPoolSize pool_sizes[2];
+    VkDescriptorSetAllocateInfo set_alloc_info;
+    VkWriteDescriptorSet writes[2];
+    VkDescriptorImageInfo image_desc_info;
+    VkDescriptorImageInfo sampler_desc_info;
+    VkImageCreateInfo image_info;
+    VkImageViewCreateInfo view_info;
+    VkSamplerCreateInfo sampler_info;
+    VkMemoryRequirements mem_req;
+    VkMemoryAllocateInfo alloc_info;
+    VkBindImageMemoryInfo bind_info;
+    VkCommandPoolCreateInfo pool_ci;
+    VkCommandBufferAllocateInfo cb_ai;
+    VkCommandBufferBeginInfo begin_info;
+    VkSubmitInfo2 submit_info;
+    VkCommandBufferSubmitInfo cb_submit_info;
+    VkImageMemoryBarrier2 barrier;
+    VkDependencyInfo dep_info;
+    VkClearColorValue clear_color;
+    VkImageSubresourceRange full_range;
+    VkCommandPool tmp_pool = VK_NULL_HANDLE;
+    VkCommandBuffer tmp_cb = VK_NULL_HANDLE;
+    struct vkd3d_queue *vkd3d_queue = NULL;
+    VkQueue vk_queue = VK_NULL_HANDLE;
+    uint32_t mem_type_index = UINT32_MAX;
+    uint32_t i;
+    VkResult vr;
+    HRESULT hr = E_FAIL;
+
+    memset(fb, 0, sizeof(*fb));
+
+    /* 1x1x1 R8G8B8A8_UNORM Texture3D. */
+    memset(&image_info, 0, sizeof(image_info));
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_3D;
+    image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image_info.extent.width = 1;
+    image_info.extent.height = 1;
+    image_info.extent.depth = 1;
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if ((vr = VK_CALL(vkCreateImage(device->vk_device, &image_info, NULL, &fb->vk_image))) != VK_SUCCESS)
+        goto fail;
+
+    VK_CALL(vkGetImageMemoryRequirements(device->vk_device, fb->vk_image, &mem_req));
+    for (i = 0; i < device->memory_properties.memoryTypeCount; i++)
+    {
+        if (!(mem_req.memoryTypeBits & (1u << i)))
+            continue;
+        if (device->memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        {
+            mem_type_index = i;
+            break;
+        }
+    }
+    if (mem_type_index == UINT32_MAX)
+    {
+        ERR("[NULL-SRV-FALLBACK] no DEVICE_LOCAL memory type available.\n");
+        goto fail;
+    }
+    memset(&alloc_info, 0, sizeof(alloc_info));
+    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.allocationSize = mem_req.size;
+    alloc_info.memoryTypeIndex = mem_type_index;
+    if ((vr = VK_CALL(vkAllocateMemory(device->vk_device, &alloc_info, NULL, &fb->vk_memory))) != VK_SUCCESS)
+        goto fail;
+
+    memset(&bind_info, 0, sizeof(bind_info));
+    bind_info.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
+    bind_info.image = fb->vk_image;
+    bind_info.memory = fb->vk_memory;
+    bind_info.memoryOffset = 0;
+    if ((vr = VK_CALL(vkBindImageMemory2(device->vk_device, 1, &bind_info))) != VK_SUCCESS)
+        goto fail;
+
+    memset(&view_info, 0, sizeof(view_info));
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = fb->vk_image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.layerCount = 1;
+    if ((vr = VK_CALL(vkCreateImageView(device->vk_device, &view_info, NULL, &fb->vk_image_view))) != VK_SUCCESS)
+        goto fail;
+
+    /* Default sampler (linear, clamp, no anisotropy) for the null-sampler
+     * fallback. Used when shaders declare a sampler register not covered
+     * by the RS — same root cause as the image case. */
+    memset(&sampler_info, 0, sizeof(sampler_info));
+    sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampler_info.magFilter = VK_FILTER_LINEAR;
+    sampler_info.minFilter = VK_FILTER_LINEAR;
+    sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.maxLod = VK_LOD_CLAMP_NONE;
+    sampler_info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    if ((vr = VK_CALL(vkCreateSampler(device->vk_device, &sampler_info, NULL, &fb->vk_sampler))) != VK_SUCCESS)
+        goto fail;
+
+    /* 2 bindings: SAMPLED_IMAGE @ binding[0], SAMPLER @ binding[1]. */
+    memset(set_bindings, 0, sizeof(set_bindings));
+    set_bindings[0].binding = 0;
+    set_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    set_bindings[0].descriptorCount = 1;
+    set_bindings[0].stageFlags = VK_SHADER_STAGE_ALL;
+    set_bindings[1].binding = 1;
+    set_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    set_bindings[1].descriptorCount = 1;
+    set_bindings[1].stageFlags = VK_SHADER_STAGE_ALL;
+    memset(&set_layout_info, 0, sizeof(set_layout_info));
+    set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    set_layout_info.bindingCount = 2;
+    set_layout_info.pBindings = set_bindings;
+    if ((vr = VK_CALL(vkCreateDescriptorSetLayout(device->vk_device, &set_layout_info, NULL,
+            &fb->vk_set_layout))) != VK_SUCCESS)
+        goto fail;
+
+    pool_sizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    pool_sizes[0].descriptorCount = 1;
+    pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    pool_sizes[1].descriptorCount = 1;
+    memset(&pool_info, 0, sizeof(pool_info));
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 2;
+    pool_info.pPoolSizes = pool_sizes;
+    if ((vr = VK_CALL(vkCreateDescriptorPool(device->vk_device, &pool_info, NULL, &fb->vk_pool))) != VK_SUCCESS)
+        goto fail;
+
+    memset(&set_alloc_info, 0, sizeof(set_alloc_info));
+    set_alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_alloc_info.descriptorPool = fb->vk_pool;
+    set_alloc_info.descriptorSetCount = 1;
+    set_alloc_info.pSetLayouts = &fb->vk_set_layout;
+    if ((vr = VK_CALL(vkAllocateDescriptorSets(device->vk_device, &set_alloc_info, &fb->vk_set))) != VK_SUCCESS)
+        goto fail;
+
+    /* One-shot graphics-queue submit: UNDEFINED -> CLEAR(0,0,0,0) -> SHADER_READ_ONLY_OPTIMAL. */
+    memset(&pool_ci, 0, sizeof(pool_ci));
+    pool_ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool_ci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pool_ci.queueFamilyIndex = device->queue_families[VKD3D_QUEUE_FAMILY_GRAPHICS]->vk_family_index;
+    if ((vr = VK_CALL(vkCreateCommandPool(device->vk_device, &pool_ci, NULL, &tmp_pool))) != VK_SUCCESS)
+        goto fail;
+
+    memset(&cb_ai, 0, sizeof(cb_ai));
+    cb_ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb_ai.commandPool = tmp_pool;
+    cb_ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb_ai.commandBufferCount = 1;
+    if ((vr = VK_CALL(vkAllocateCommandBuffers(device->vk_device, &cb_ai, &tmp_cb))) != VK_SUCCESS)
+        goto fail;
+
+    memset(&begin_info, 0, sizeof(begin_info));
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CALL(vkBeginCommandBuffer(tmp_cb, &begin_info));
+
+    memset(&full_range, 0, sizeof(full_range));
+    full_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    full_range.levelCount = 1;
+    full_range.layerCount = 1;
+
+    /* UNDEFINED -> TRANSFER_DST_OPTIMAL */
+    memset(&barrier, 0, sizeof(barrier));
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+    barrier.srcAccessMask = VK_ACCESS_2_NONE;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = fb->vk_image;
+    barrier.subresourceRange = full_range;
+    memset(&dep_info, 0, sizeof(dep_info));
+    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep_info.imageMemoryBarrierCount = 1;
+    dep_info.pImageMemoryBarriers = &barrier;
+    VK_CALL(vkCmdPipelineBarrier2(tmp_cb, &dep_info));
+
+    memset(&clear_color, 0, sizeof(clear_color));
+    VK_CALL(vkCmdClearColorImage(tmp_cb, fb->vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            &clear_color, 1, &full_range));
+
+    /* TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL */
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VK_CALL(vkCmdPipelineBarrier2(tmp_cb, &dep_info));
+
+    VK_CALL(vkEndCommandBuffer(tmp_cb));
+
+    vkd3d_queue = device->queue_families[VKD3D_QUEUE_FAMILY_GRAPHICS]->queues[0];
+    if (!(vk_queue = vkd3d_queue_acquire(vkd3d_queue)))
+    {
+        ERR("[NULL-SRV-FALLBACK] failed to acquire graphics queue.\n");
+        goto fail;
+    }
+
+    memset(&cb_submit_info, 0, sizeof(cb_submit_info));
+    cb_submit_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cb_submit_info.commandBuffer = tmp_cb;
+    memset(&submit_info, 0, sizeof(submit_info));
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit_info.commandBufferInfoCount = 1;
+    submit_info.pCommandBufferInfos = &cb_submit_info;
+    vr = VK_CALL(vkQueueSubmit2(vk_queue, 1, &submit_info, VK_NULL_HANDLE));
+    if (vr == VK_SUCCESS)
+        VK_CALL(vkQueueWaitIdle(vk_queue));
+    vkd3d_queue_release(vkd3d_queue);
+    if (vr != VK_SUCCESS)
+        goto fail;
+
+    /* Write both descriptors: image at binding[0], sampler at binding[1]. */
+    memset(&image_desc_info, 0, sizeof(image_desc_info));
+    image_desc_info.imageView = fb->vk_image_view;
+    image_desc_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    memset(&sampler_desc_info, 0, sizeof(sampler_desc_info));
+    sampler_desc_info.sampler = fb->vk_sampler;
+    memset(writes, 0, sizeof(writes));
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = fb->vk_set;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[0].pImageInfo = &image_desc_info;
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = fb->vk_set;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    writes[1].pImageInfo = &sampler_desc_info;
+    VK_CALL(vkUpdateDescriptorSets(device->vk_device, 2, writes, 0, NULL));
+
+    /* The publishable slot index is filled in per-root-signature at pipeline-
+     * layout build time. Bindings are fixed: image=0, sampler=1. */
+    fb->set_index = 0;
+    fb->image_binding_index = 0;
+    fb->sampler_binding_index = 1;
+    fb->active = true;
+
+    INFO("[NULL-SRV-FALLBACK] initialized (Texture3D zero sentinel + default sampler).\n");
+    hr = S_OK;
+
+done:
+    if (tmp_cb != VK_NULL_HANDLE && tmp_pool != VK_NULL_HANDLE)
+        VK_CALL(vkFreeCommandBuffers(device->vk_device, tmp_pool, 1, &tmp_cb));
+    if (tmp_pool != VK_NULL_HANDLE)
+        VK_CALL(vkDestroyCommandPool(device->vk_device, tmp_pool, NULL));
+    return hr;
+
+fail:
+    vkd3d_null_srv_fallback_cleanup(fb, device);
+    hr = E_FAIL;
+    goto done;
+}
+
+void vkd3d_null_srv_fallback_cleanup(struct vkd3d_null_srv_fallback *fb,
+        struct d3d12_device *device)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+
+    if (!fb)
+        return;
+    if (fb->vk_pool != VK_NULL_HANDLE)
+        VK_CALL(vkDestroyDescriptorPool(device->vk_device, fb->vk_pool, NULL));
+    if (fb->vk_set_layout != VK_NULL_HANDLE)
+        VK_CALL(vkDestroyDescriptorSetLayout(device->vk_device, fb->vk_set_layout, NULL));
+    if (fb->vk_sampler != VK_NULL_HANDLE)
+        VK_CALL(vkDestroySampler(device->vk_device, fb->vk_sampler, NULL));
+    if (fb->vk_image_view != VK_NULL_HANDLE)
+        VK_CALL(vkDestroyImageView(device->vk_device, fb->vk_image_view, NULL));
+    if (fb->vk_image != VK_NULL_HANDLE)
+        VK_CALL(vkDestroyImage(device->vk_device, fb->vk_image, NULL));
+    if (fb->vk_memory != VK_NULL_HANDLE)
+        VK_CALL(vkFreeMemory(device->vk_device, fb->vk_memory, NULL));
+    memset(fb, 0, sizeof(*fb));
 }

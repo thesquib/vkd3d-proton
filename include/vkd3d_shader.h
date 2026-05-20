@@ -267,6 +267,11 @@ enum vkd3d_shader_interface_flag
     VKD3D_SHADER_INTERFACE_INLINE_REDZONE_CBV                  = 0x00002000u,
     VKD3D_SHADER_INTERFACE_RAYTRACING_OPACITY_MICROMAP         = 0x00004000u,
     VKD3D_SHADER_INTERFACE_RAY_QUERY_OMM_DEVICE_GLOBAL         = 0x00008000u,
+    /* When set, dxil_srv_remap may, on a normal-remap failure for SRV, substitute
+     * a device-supplied (set, binding) pointing at a zero-filled null sampled
+     * image. Currently limited to Texture3D bindings.
+     * See VKD3D_CONFIG_FLAG_RELAXED_UNMAPPED_SRV. */
+    VKD3D_SHADER_INTERFACE_RELAXED_UNMAPPED_SRV                = 0x00010000u,
 };
 
 struct vkd3d_shader_stage_io_entry
@@ -333,6 +338,11 @@ struct vkd3d_shader_interface_info
     unsigned int root_parameter_mapping_count;
     const void *root_signature_blob;
     size_t root_signature_blob_size;
+
+    /* Only consulted when VKD3D_SHADER_INTERFACE_RELAXED_UNMAPPED_SRV is set. */
+    unsigned int null_srv_fallback_set;
+    unsigned int null_srv_fallback_binding;
+    unsigned int null_sampler_fallback_binding;
 };
 
 struct vkd3d_shader_descriptor_table
