@@ -160,8 +160,44 @@ static dxil_spv_bool dxil_remap_inner(
         dxil_spv_vulkan_binding *vk_binding,
         uint32_t resource_flags)
 {
+    static int s_srv6_trace_cached = -1;
+    bool srv6_trace;
     unsigned int root_descriptor_index = 0;
     unsigned int i;
+
+    /* [SRV6-TRACE] PROTON_VKD3D_SRV6_TRACE=1: dump the bindings array + per-predicate
+     * match results whenever (SRV, space=0, register=6) is queried. One-shot env probe
+     * cached on first call; ERR-level so it survives default log channels. */
+    if (s_srv6_trace_cached < 0)
+        s_srv6_trace_cached = getenv("PROTON_VKD3D_SRV6_TRACE") ? 1 : 0;
+    srv6_trace = s_srv6_trace_cached &&
+            descriptor_type == VKD3D_SHADER_DESCRIPTOR_TYPE_SRV &&
+            d3d_binding->register_space == 0 &&
+            d3d_binding->register_index == 6;
+
+    if (srv6_trace)
+    {
+        ERR("[SRV6-TRACE] dxil_remap_inner called: type=%u space=%u reg=%u "
+                "range_size=%u kind=%u stage=%u resource_flags=0x%x binding_count=%u\n",
+                (unsigned)descriptor_type, d3d_binding->register_space, d3d_binding->register_index,
+                d3d_binding->range_size, (unsigned)d3d_binding->kind,
+                (unsigned)d3d_binding->stage, resource_flags, remap->binding_count);
+        for (i = 0; i < remap->binding_count; i++)
+        {
+            const struct vkd3d_shader_resource_binding *b = &remap->bindings[i];
+            const uint32_t srv6_mask = ~(VKD3D_SHADER_BINDING_FLAG_BINDLESS | VKD3D_SHADER_BINDING_FLAG_RAW_VA);
+            uint32_t b_match_flags = b->flags & srv6_mask;
+            int r1 = (b->type == descriptor_type);
+            int r2 = dxil_resource_is_in_range(b, d3d_binding);
+            int r3 = ((b_match_flags & resource_flags) == resource_flags);
+            int r4 = dxil_match_shader_visibility(b->shader_visibility, d3d_binding->stage);
+            ERR("[SRV6-TRACE]   binding[%u]: type=%u space=%u reg=%u count=%u vis=%u "
+                    "flags=0x%x match_flags=0x%x | type_ok=%d range_ok=%d flags_ok=%d vis_ok=%d\n",
+                    i, (unsigned)b->type, b->register_space, b->register_index,
+                    b->register_count, (unsigned)b->shader_visibility, b->flags,
+                    b_match_flags, r1, r2, r3, r4);
+        }
+    }
 
     for (i = 0; i < remap->binding_count; i++)
     {
@@ -273,6 +309,37 @@ static dxil_spv_bool dxil_remap(const struct vkd3d_dxil_remap_userdata *remap,
         return DXIL_SPV_TRUE;
 }
 
+/* [NULL-SRV-FALLBACK] When normal remap fails and the caller opted in via
+ * VKD3D_SHADER_INTERFACE_RELAXED_UNMAPPED_SRV, populate vk_binding with the
+ * device-supplied (set, binding) of a zero-filled null sampled image.
+ * Initial scope: kind == TEXTURE_3D only. */
+static dxil_spv_bool dxil_try_emit_null_srv_fallback(
+        const struct vkd3d_shader_interface_info *shader_interface_info,
+        const dxil_spv_d3d_binding *d3d_binding,
+        dxil_spv_vulkan_binding *vk_binding)
+{
+    if (!shader_interface_info)
+        return DXIL_SPV_FALSE;
+    if (!(shader_interface_info->flags & VKD3D_SHADER_INTERFACE_RELAXED_UNMAPPED_SRV))
+        return DXIL_SPV_FALSE;
+    if (d3d_binding->kind != DXIL_SPV_RESOURCE_KIND_TEXTURE_3D)
+        return DXIL_SPV_FALSE;
+
+    memset(vk_binding, 0, sizeof(*vk_binding));
+    vk_binding->set = shader_interface_info->null_srv_fallback_set;
+    vk_binding->binding = shader_interface_info->null_srv_fallback_binding;
+    vk_binding->bindless.use_heap = DXIL_SPV_FALSE;
+    vk_binding->descriptor_type = DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;
+
+    ERR("[NULL-SRV-FALLBACK] kind=%u space=%u reg=%u range=%u stage=%u "
+            "-> set=%u binding=%u (device null Texture3D sentinel)\n",
+            (unsigned)d3d_binding->kind, d3d_binding->register_space,
+            d3d_binding->register_index, d3d_binding->range_size,
+            (unsigned)d3d_binding->stage,
+            vk_binding->set, vk_binding->binding);
+    return DXIL_SPV_TRUE;
+}
+
 static dxil_spv_bool dxil_srv_remap(void *userdata, const dxil_spv_d3d_binding *d3d_binding,
                                     dxil_spv_srv_vulkan_binding *vk_binding)
 {
@@ -307,16 +374,55 @@ static dxil_spv_bool dxil_srv_remap(void *userdata, const dxil_spv_d3d_binding *
         }
     }
 
-    return dxil_remap(remap, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV,
-            d3d_binding, &vk_binding->buffer_binding, resource_flags);
+    if (dxil_remap(remap, VKD3D_SHADER_DESCRIPTOR_TYPE_SRV,
+            d3d_binding, &vk_binding->buffer_binding, resource_flags))
+        return DXIL_SPV_TRUE;
+
+    /* Both SSBO and TEXEL_BUFFER paths failed. Opt-in null-descriptor
+     * fallback for Texture3D: emit a binding pointing at the device's
+     * zero-filled sentinel image so the PSO compiles and sample reads
+     * deterministically return zero. */
+    return dxil_try_emit_null_srv_fallback(shader_interface_info,
+            d3d_binding, &vk_binding->buffer_binding);
+}
+
+/* [NULL-SRV-FALLBACK] Same idea as dxil_try_emit_null_srv_fallback but for
+ * samplers. CryEngine HDRFinalScenePS Tex3D PSOs reference (s2, space0) which
+ * the RS also doesn't declare. Emits a binding pointing at the device's
+ * default linear/clamp sampler. */
+static dxil_spv_bool dxil_try_emit_null_sampler_fallback(
+        const struct vkd3d_shader_interface_info *shader_interface_info,
+        const dxil_spv_d3d_binding *d3d_binding,
+        dxil_spv_vulkan_binding *vk_binding)
+{
+    if (!shader_interface_info)
+        return DXIL_SPV_FALSE;
+    if (!(shader_interface_info->flags & VKD3D_SHADER_INTERFACE_RELAXED_UNMAPPED_SRV))
+        return DXIL_SPV_FALSE;
+
+    memset(vk_binding, 0, sizeof(*vk_binding));
+    vk_binding->set = shader_interface_info->null_srv_fallback_set;
+    vk_binding->binding = shader_interface_info->null_sampler_fallback_binding;
+    vk_binding->bindless.use_heap = DXIL_SPV_FALSE;
+    vk_binding->descriptor_type = DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;
+
+    ERR("[NULL-SRV-FALLBACK] sampler space=%u reg=%u stage=%u -> set=%u binding=%u (device default sampler)\n",
+            d3d_binding->register_space, d3d_binding->register_index,
+            (unsigned)d3d_binding->stage,
+            vk_binding->set, vk_binding->binding);
+    return DXIL_SPV_TRUE;
 }
 
 static dxil_spv_bool dxil_sampler_remap(void *userdata, const dxil_spv_d3d_binding *d3d_binding,
                                         dxil_spv_vulkan_binding *vk_binding)
 {
     const struct vkd3d_dxil_remap_userdata *remap = userdata;
-    return dxil_remap(remap, VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER,
-            d3d_binding, vk_binding, VKD3D_SHADER_BINDING_FLAG_IMAGE);
+    if (dxil_remap(remap, VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER,
+            d3d_binding, vk_binding, VKD3D_SHADER_BINDING_FLAG_IMAGE))
+        return DXIL_SPV_TRUE;
+
+    return dxil_try_emit_null_sampler_fallback(remap->shader_interface_info,
+            d3d_binding, vk_binding);
 }
 
 static dxil_spv_bool dxil_input_remap(void *userdata, const dxil_spv_d3d_vertex_input *d3d_input,

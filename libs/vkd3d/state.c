@@ -1535,6 +1535,25 @@ static HRESULT d3d12_root_signature_init_global(struct d3d12_root_signature *roo
     d3d12_root_signature_update_bind_point_layout(&root_signature->raygen,
             &push_constant_range, &context, &info);
 
+    /* [NULL-SRV-FALLBACK] Append the device's zero-sentinel descriptor set to
+     * the pipeline layout when VKD3D_CONFIG_FLAG_RELAXED_UNMAPPED_SRV is on
+     * and the device init succeeded. Bumps every bind-point's num_set_layouts
+     * by 1. dxil_srv_remap emits bindings against this (set, binding) when
+     * normal SRV remap fails for a Texture3D. */
+    root_signature->null_srv_fallback_set = UINT32_MAX;
+    if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_RELAXED_UNMAPPED_SRV) &&
+            device->null_srv_fallback.active)
+    {
+        assert(context.vk_set < VKD3D_MAX_DESCRIPTOR_SETS);
+        root_signature->null_srv_fallback_set = context.vk_set;
+        root_signature->set_layouts[context.vk_set] = device->null_srv_fallback.vk_set_layout;
+        context.vk_set += 1;
+        root_signature->graphics.num_set_layouts++;
+        root_signature->mesh.num_set_layouts++;
+        root_signature->compute.num_set_layouts++;
+        root_signature->raygen.num_set_layouts++;
+    }
+
     /* If we need to use restricted entry_points in vkCmdPushConstants,
      * we are unfortunately required to do it like this
      * since stageFlags in vkCmdPushConstants must cover at least all entry_points in the layout.
@@ -2650,6 +2669,25 @@ static void d3d12_pipeline_state_init_shader_interface(struct d3d12_pipeline_sta
     shader_interface->root_signature_blob_size = root_signature->root_signature_blob_size;
     shader_interface->push_constant_ubo_binding = &root_signature->push_constant_ubo_binding;
     shader_interface->offset_buffer_binding = &root_signature->offset_buffer_binding;
+
+    /* [NULL-SRV-FALLBACK] expose the device's reserved set/binding so
+     * dxil_srv_remap can emit fallback bindings when normal SRV remap fails.
+     * Only on when both the global config flag is set and the device
+     * successfully initialized the fallback. */
+    if (root_signature->null_srv_fallback_set != UINT32_MAX && device->null_srv_fallback.active)
+    {
+        shader_interface->flags |= VKD3D_SHADER_INTERFACE_RELAXED_UNMAPPED_SRV;
+        shader_interface->null_srv_fallback_set = root_signature->null_srv_fallback_set;
+        shader_interface->null_srv_fallback_binding = device->null_srv_fallback.image_binding_index;
+        shader_interface->null_sampler_fallback_binding = device->null_srv_fallback.sampler_binding_index;
+    }
+    else
+    {
+        shader_interface->null_srv_fallback_set = 0;
+        shader_interface->null_srv_fallback_binding = 0;
+        shader_interface->null_sampler_fallback_binding = 0;
+    }
+
     shader_interface->stage = stage;
     shader_interface->xfb_info = state->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS &&
             stage == state->graphics.cached_desc.xfb_stage ?

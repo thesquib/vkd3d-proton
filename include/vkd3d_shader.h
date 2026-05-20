@@ -261,6 +261,11 @@ enum vkd3d_shader_interface_flag
     VKD3D_SHADER_INTERFACE_INSTRUCTION_QA_BUFFER_EXPECT_ASSUME = 0x00000200u,
     VKD3D_SHADER_INTERFACE_INSTRUCTION_QA_BUFFER_SYNC          = 0x00000400u,
     VKD3D_SHADER_INTERFACE_INSTRUCTION_QA_BUFFER_SYNC_COMPUTE  = 0x00000800u,
+    /* When set, dxil_srv_remap may, on a normal-remap failure for SRV, substitute
+     * a device-supplied (set, binding) pointing at a zero-filled null sampled
+     * image. Currently limited to Texture3D bindings.
+     * See VKD3D_CONFIG_FLAG_RELAXED_UNMAPPED_SRV. */
+    VKD3D_SHADER_INTERFACE_RELAXED_UNMAPPED_SRV                = 0x00001000u,
 };
 
 struct vkd3d_shader_stage_io_entry
@@ -326,6 +331,11 @@ struct vkd3d_shader_interface_info
     unsigned int root_parameter_mapping_count;
     const void *root_signature_blob;
     size_t root_signature_blob_size;
+
+    /* Only consulted when VKD3D_SHADER_INTERFACE_RELAXED_UNMAPPED_SRV is set. */
+    unsigned int null_srv_fallback_set;
+    unsigned int null_srv_fallback_binding;
+    unsigned int null_sampler_fallback_binding;
 };
 
 struct vkd3d_shader_descriptor_table

@@ -5926,6 +5926,8 @@ void d3d12_command_list_invalidate_root_parameters(struct d3d12_command_list *li
         bindings->dirty_flags |= VKD3D_PIPELINE_DIRTY_STATIC_SAMPLER_SET;
     if (bindings->root_signature->hoist_info.num_desc)
         bindings->dirty_flags |= VKD3D_PIPELINE_DIRTY_HOISTED_DESCRIPTORS;
+    if (bindings->root_signature->null_srv_fallback_set != UINT32_MAX)
+        bindings->dirty_flags |= VKD3D_PIPELINE_DIRTY_NULL_SRV_FALLBACK_SET;
 
     d3d12_command_list_invalidate_push_constants(bindings);
 
@@ -7654,6 +7656,23 @@ static void d3d12_command_list_update_static_samplers(struct d3d12_command_list 
     bindings->dirty_flags &= ~VKD3D_PIPELINE_DIRTY_STATIC_SAMPLER_SET;
 }
 
+static void d3d12_command_list_update_null_srv_fallback(struct d3d12_command_list *list,
+        struct vkd3d_pipeline_bindings *bindings, VkPipelineBindPoint vk_bind_point,
+        VkPipelineLayout layout)
+{
+    const struct d3d12_root_signature *root_signature = bindings->root_signature;
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+
+    if (root_signature->null_srv_fallback_set != UINT32_MAX)
+    {
+        VK_CALL(vkCmdBindDescriptorSets(list->cmd.vk_command_buffer, vk_bind_point,
+                layout,
+                root_signature->null_srv_fallback_set,
+                1, &list->device->null_srv_fallback.vk_set, 0, NULL));
+    }
+    bindings->dirty_flags &= ~VKD3D_PIPELINE_DIRTY_NULL_SRV_FALLBACK_SET;
+}
+
 static void d3d12_command_list_update_root_constants(struct d3d12_command_list *list,
         struct vkd3d_pipeline_bindings *bindings,
         VkPipelineLayout layout, VkShaderStageFlags push_stages)
@@ -7934,6 +7953,12 @@ static void d3d12_command_list_update_descriptors(struct d3d12_command_list *lis
 
     if (bindings->dirty_flags & VKD3D_PIPELINE_DIRTY_STATIC_SAMPLER_SET)
         d3d12_command_list_update_static_samplers(list, bindings, vk_bind_point, layout);
+
+    /* [NULL-SRV-FALLBACK] bind the device's zero-sentinel set once per root
+     * signature switch. The set's contents are immutable so no per-frame
+     * tracking is needed beyond this one invalidation-driven bind. */
+    if (bindings->dirty_flags & VKD3D_PIPELINE_DIRTY_NULL_SRV_FALLBACK_SET)
+        d3d12_command_list_update_null_srv_fallback(list, bindings, vk_bind_point, layout);
 
     /* If we can, hoist descriptors from the descriptor heap into fake root parameters. */
     if (bindings->dirty_flags & VKD3D_PIPELINE_DIRTY_HOISTED_DESCRIPTORS)
