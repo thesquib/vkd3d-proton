@@ -38,6 +38,12 @@ static void d3d12_shared_fence_dec_ref(struct d3d12_shared_fence *fence);
 static void d3d12_fence_iface_inc_ref(d3d12_fence_iface *iface);
 static void d3d12_fence_iface_dec_ref(d3d12_fence_iface *iface);
 static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *allocator);
+
+/* [RTV-ATTR] PROTON_VKD3D_RTV_ATTR=1 helpers — defined alongside OMSetRenderTargets. */
+static void proton_rtv_attr_capture_binding(struct d3d12_command_list *list);
+static void proton_rtv_attr_count_draw(struct d3d12_command_list *list, uint64_t verts);
+static void proton_rtv_attr_count_dispatch(struct d3d12_command_list *list);
+static bool proton_rtv_attr_should_log(uint32_t *counter, unsigned period_multiplier);
 static HRESULT d3d12_fence_signal_cpu_timeline_semaphore(struct d3d12_fence *fence, uint64_t value);
 
 /* This must be at least twice the number of texture region batches, since we must be able to resolve
@@ -6549,10 +6555,87 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_Close(d3d12_command_list_ifa
 
     if (vkd3d_trace_draw_enabled())
     {
-        INFO("[DRAW-TRACE] cmdlist closed list=%p type=%u draws=%u dispatches=%u pid=%lu tid=%lu\n",
+        INFO("[DRAW-TRACE] cmdlist closed list=%p type=%u draws=%u dispatches=%u indirect=%u bundles=%u mesh=%u barrier=%u clear=%u omrt=%u setpso=%u setroot=%u setvb=%u pid=%lu tid=%lu\n",
                 list, (unsigned)list->type, list->draw_count_trace, list->dispatch_count_trace,
+                list->indirect_count_trace, list->bundle_count_trace, list->mesh_count_trace,
+                list->barrier_count_trace, list->clear_count_trace, list->omrt_count_trace,
+                list->setpso_count_trace, list->setrootsig_count_trace, list->setvb_count_trace,
                 (unsigned long)GetCurrentProcessId(),
                 (unsigned long)GetCurrentThreadId());
+    }
+
+    /* [RTV-ATTR] Per-cmdlist RTV attribution log. Throttled: log every
+     * cmdlist for the first PROTON_VKD3D_RTV_ATTR_WARMUP (default 50)
+     * closes, then every PROTON_VKD3D_RTV_ATTR_PERIOD'th (default 2048).
+     * Throttle counters use static globals; precise serialization is not
+     * required, only "approximately the right cadence". */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_close_counter = 0;
+        static int s_warmup_cached = -1;
+        static int s_period_cached = -1;
+        uint32_t n;
+        unsigned int warmup, period;
+        bool should_log;
+
+        if (s_warmup_cached < 0)
+            s_warmup_cached = (int)vkd3d_env_var_as_uint("PROTON_VKD3D_RTV_ATTR_WARMUP", 50);
+        if (s_period_cached < 0)
+            s_period_cached = (int)vkd3d_env_var_as_uint("PROTON_VKD3D_RTV_ATTR_PERIOD", 2048);
+        warmup = (unsigned)s_warmup_cached;
+        period = (unsigned)s_period_cached;
+        if (period == 0) period = 1;
+
+        n = vkd3d_atomic_uint32_increment(&s_close_counter, vkd3d_memory_order_relaxed);
+        should_log = (n <= warmup) || ((n - warmup) % period == 0);
+
+        if (should_log)
+        {
+            unsigned int i;
+            for (i = 0; i < list->proton_rtv_attr_count; ++i)
+            {
+                if (!list->proton_rtv_attr[i].resource_id &&
+                        !list->proton_rtv_attr[i].draws_since_bind)
+                    continue;
+                fprintf(stderr,
+                        "[RTV-ATTR] cmdlist=%p slot=%u rtv_id=%u format=%u dims=%ux%u draws=%u verts=%llu\n",
+                        (void*)list, i,
+                        list->proton_rtv_attr[i].resource_id,
+                        list->proton_rtv_attr[i].format,
+                        list->proton_rtv_attr[i].width,
+                        list->proton_rtv_attr[i].height,
+                        list->proton_rtv_attr[i].draws_since_bind,
+                        (unsigned long long)list->proton_rtv_attr[i].verts_since_bind);
+            }
+            fprintf(stderr,
+                    "[RTV-ATTR-SUMMARY] cmdlist=%p n=%u total_rtvs_bound=%u total_omrt_calls=%u total_draws=%u total_dispatches=%u draws_traced=%u dispatches_traced=%u indirect=%u mesh=%u clear_rtv=%u clear_dsv=%u copy_res=%u copy_texreg=%u copy_buf=%u resolve=%u discard=%u setpso=%u setrootsig=%u setrootsig_compute=%u iasetvb=%u iasetib=%u iasetprim=%u rsvp=%u rssc=%u setdesctbl=%u\n",
+                    (void*)list, n,
+                    list->proton_rtv_attr_count,
+                    list->proton_rtv_attr_total_binds,
+                    list->proton_rtv_attr_total_draws,
+                    list->proton_rtv_attr_total_dispatches,
+                    list->draw_count_trace,
+                    list->dispatch_count_trace,
+                    list->indirect_count_trace,
+                    list->mesh_count_trace,
+                    list->proton_rtv_attr_clear_rtv_count,
+                    list->proton_rtv_attr_clear_dsv_count,
+                    list->proton_rtv_attr_copy_resource_count,
+                    list->proton_rtv_attr_copy_texregion_count,
+                    list->proton_rtv_attr_copy_buffer_count,
+                    list->proton_rtv_attr_resolve_count,
+                    list->proton_rtv_attr_discard_count,
+                    list->proton_rtv_attr_setpso_count,
+                    list->proton_rtv_attr_setrootsig_count,
+                    list->proton_rtv_attr_setrootsig_compute_count,
+                    list->proton_rtv_attr_iasetvb_count,
+                    list->proton_rtv_attr_iasetib_count,
+                    list->proton_rtv_attr_iasetprim_count,
+                    list->proton_rtv_attr_rsvp_count,
+                    list->proton_rtv_attr_rssc_count,
+                    list->proton_rtv_attr_setrootdesctbl_count);
+            fflush(stderr);
+        }
     }
 
     if (!list->is_recording)
@@ -6920,6 +7003,38 @@ static void d3d12_command_list_reset_internal_state(struct d3d12_command_list *l
     /* [DRAW-TRACE] reset diagnostic counters when the list is reset for reuse. */
     list->draw_count_trace = 0;
     list->dispatch_count_trace = 0;
+    list->indirect_count_trace = 0;
+    list->bundle_count_trace = 0;
+    list->mesh_count_trace = 0;
+    list->barrier_count_trace = 0;
+    list->clear_count_trace = 0;
+    list->omrt_count_trace = 0;
+    list->setpso_count_trace = 0;
+    list->setrootsig_count_trace = 0;
+    list->setvb_count_trace = 0;
+
+    /* [RTV-ATTR] reset PROTON_VKD3D_RTV_ATTR per-cmdlist state. */
+    memset(list->proton_rtv_attr, 0, sizeof(list->proton_rtv_attr));
+    list->proton_rtv_attr_count = 0;
+    list->proton_rtv_attr_total_binds = 0;
+    list->proton_rtv_attr_total_draws = 0;
+    list->proton_rtv_attr_total_dispatches = 0;
+    list->proton_rtv_attr_clear_rtv_count = 0;
+    list->proton_rtv_attr_clear_dsv_count = 0;
+    list->proton_rtv_attr_copy_resource_count = 0;
+    list->proton_rtv_attr_copy_texregion_count = 0;
+    list->proton_rtv_attr_copy_buffer_count = 0;
+    list->proton_rtv_attr_resolve_count = 0;
+    list->proton_rtv_attr_discard_count = 0;
+    list->proton_rtv_attr_setpso_count = 0;
+    list->proton_rtv_attr_setrootsig_count = 0;
+    list->proton_rtv_attr_setrootsig_compute_count = 0;
+    list->proton_rtv_attr_iasetvb_count = 0;
+    list->proton_rtv_attr_iasetib_count = 0;
+    list->proton_rtv_attr_iasetprim_count = 0;
+    list->proton_rtv_attr_rsvp_count = 0;
+    list->proton_rtv_attr_rssc_count = 0;
+    list->proton_rtv_attr_setrootdesctbl_count = 0;
 
     for (i = 0; i < list->retained_resources_count; i++)
         d3d12_resource_decref_weak(list->retained_resources[i]);
@@ -8593,6 +8708,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_lis
     if (vkd3d_trace_draw_enabled())
         vkd3d_atomic_uint32_increment(&list->draw_count_trace, vkd3d_memory_order_relaxed);
 
+    /* [RTV-ATTR] attribute this draw to currently-bound RTV slots. */
+    proton_rtv_attr_count_draw(list,
+            (uint64_t)vertex_count_per_instance * (uint64_t)instance_count);
+
     d3d12_command_list_flush_dgc_batch(list);
 
     if (list->predication.fallback_enabled)
@@ -8681,6 +8800,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
     /* [DRAW-TRACE] count this draw against the recording command list. */
     if (vkd3d_trace_draw_enabled())
         vkd3d_atomic_uint32_increment(&list->draw_count_trace, vkd3d_memory_order_relaxed);
+
+    /* [RTV-ATTR] attribute this indexed draw to currently-bound RTV slots. */
+    proton_rtv_attr_count_draw(list,
+            (uint64_t)index_count_per_instance * (uint64_t)instance_count);
 
     d3d12_command_list_flush_dgc_batch(list);
 
@@ -8852,6 +8975,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
     if (vkd3d_trace_draw_enabled())
         vkd3d_atomic_uint32_increment(&list->dispatch_count_trace, vkd3d_memory_order_relaxed);
 
+    /* [RTV-ATTR] count this dispatch against the cmdlist (not attributed to an RTV). */
+    proton_rtv_attr_count_dispatch(list);
+
     d3d12_command_list_check_render_pass_validation(list, "Dispatch called within a render pass.\n", true);
     d3d12_command_list_flush_dgc_batch(list);
 
@@ -8937,6 +9063,26 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
     assert(d3d12_resource_is_buffer(dst_resource));
     src_resource = impl_from_ID3D12Resource(src);
     assert(d3d12_resource_is_buffer(src_resource));
+
+    /* [RTV-ATTR] log per-CopyBufferRegion attribution. 10x throttle vs
+     * other commands because upload heaps fire this on every frame. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_copy_buffer_log_counter = 0;
+        list->proton_rtv_attr_copy_buffer_count++;
+        if (proton_rtv_attr_should_log(&s_copy_buffer_log_counter, 10))
+        {
+            uint32_t dst_id = dst_resource ? dst_resource->proton_resource_id : 0;
+            uint32_t src_id = src_resource ? src_resource->proton_resource_id : 0;
+            fprintf(stderr,
+                    "[RTV-ATTR-COPY] cmdlist=%p type=buf dst_id=%u src_id=%u dst_offset=%llu src_offset=%llu bytes=%llu\n",
+                    (void*)list, dst_id, src_id,
+                    (unsigned long long)dst_offset,
+                    (unsigned long long)src_offset,
+                    (unsigned long long)byte_count);
+            fflush(stderr);
+        }
+    }
 
     d3d12_command_list_track_resource_usage(list, dst_resource, true);
     d3d12_command_list_track_resource_usage(list, src_resource, true);
@@ -10186,6 +10332,29 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTextureRegion(d3d12_command
     TRACE("iface %p, dst %p, dst_x %u, dst_y %u, dst_z %u, src %p, src_box %p.\n",
             iface, dst, dst_x, dst_y, dst_z, src, src_box);
 
+    /* [RTV-ATTR] log per-CopyTextureRegion attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_copy_texreg_log_counter = 0;
+        list->proton_rtv_attr_copy_texregion_count++;
+        if (proton_rtv_attr_should_log(&s_copy_texreg_log_counter, 1))
+        {
+            struct d3d12_resource *dst_res = dst ? impl_from_ID3D12Resource(dst->pResource) : NULL;
+            struct d3d12_resource *src_res = src ? impl_from_ID3D12Resource(src->pResource) : NULL;
+            uint32_t dst_id = dst_res ? dst_res->proton_resource_id : 0;
+            uint32_t src_id = src_res ? src_res->proton_resource_id : 0;
+            unsigned dst_subres = (dst && dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX)
+                    ? dst->SubresourceIndex : 0u;
+            unsigned src_subres = (src && src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX)
+                    ? src->SubresourceIndex : 0u;
+            fprintf(stderr,
+                    "[RTV-ATTR-COPY] cmdlist=%p type=texregion dst_id=%u src_id=%u dst_subres=%u src_subres=%u offset=(%u,%u,%u) box_present=%d\n",
+                    (void*)list, dst_id, src_id, dst_subres, src_subres,
+                    dst_x, dst_y, dst_z, src_box ? 1 : 0);
+            fflush(stderr);
+        }
+    }
+
     d3d12_command_list_check_render_pass_validation(list, "CopyTextureRegion called within a render pass.\n", true);
     d3d12_command_list_flush_dgc_batch(list);
 
@@ -10294,6 +10463,29 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
 
     dst_resource = impl_from_ID3D12Resource(dst);
     src_resource = impl_from_ID3D12Resource(src);
+
+    /* [RTV-ATTR] log per-CopyResource attribution. dst_dims/src_dims are
+     * Width x Height from the resource desc (Width is 64-bit for buffers). */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_copy_resource_log_counter = 0;
+        list->proton_rtv_attr_copy_resource_count++;
+        if (proton_rtv_attr_should_log(&s_copy_resource_log_counter, 1))
+        {
+            uint32_t dst_id = dst_resource ? dst_resource->proton_resource_id : 0;
+            uint32_t src_id = src_resource ? src_resource->proton_resource_id : 0;
+            uint64_t dst_w = dst_resource ? (uint64_t)dst_resource->desc.Width : 0;
+            uint64_t src_w = src_resource ? (uint64_t)src_resource->desc.Width : 0;
+            unsigned dst_h = dst_resource ? (unsigned)dst_resource->desc.Height : 0;
+            unsigned src_h = src_resource ? (unsigned)src_resource->desc.Height : 0;
+            fprintf(stderr,
+                    "[RTV-ATTR-COPY] cmdlist=%p type=full dst_id=%u src_id=%u dst_dims=%llux%u src_dims=%llux%u\n",
+                    (void*)list, dst_id, src_id,
+                    (unsigned long long)dst_w, dst_h,
+                    (unsigned long long)src_w, src_h);
+            fflush(stderr);
+        }
+    }
 
     if (list->type == D3D12_COMMAND_LIST_TYPE_COPY)
     {
@@ -11700,6 +11892,23 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResolveSubresource(d3d12_comman
     assert(d3d12_resource_is_texture(dst_resource));
     assert(d3d12_resource_is_texture(src_resource));
 
+    /* [RTV-ATTR] log per-ResolveSubresource attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_resolve_log_counter = 0;
+        list->proton_rtv_attr_resolve_count++;
+        if (proton_rtv_attr_should_log(&s_resolve_log_counter, 1))
+        {
+            uint32_t dst_id = dst_resource ? dst_resource->proton_resource_id : 0;
+            uint32_t src_id = src_resource ? src_resource->proton_resource_id : 0;
+            fprintf(stderr,
+                    "[RTV-ATTR-RESOLVE] cmdlist=%p dst_id=%u dst_sub=%u src_id=%u src_sub=%u format=%u\n",
+                    (void*)list, dst_id, (unsigned)dst_sub_resource_idx,
+                    src_id, (unsigned)src_sub_resource_idx, (unsigned)format);
+            fflush(stderr);
+        }
+    }
+
     vk_image_resolve.srcSubresource = vk_image_subresource_layers_from_d3d12(
             src_resource->format, src_sub_resource_idx,
             src_resource->desc.MipLevels,
@@ -11729,6 +11938,21 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetPrimitiveTopology(d3d12_co
 
     TRACE("iface %p, topology %#x.\n", iface, topology);
 
+    /* [RTV-ATTR] log per-IASetPrimitiveTopology attribution. Counted
+     * before the UNDEFINED early-return so we see "no-op" calls too. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_iasetprim_counter = 0;
+        list->proton_rtv_attr_iasetprim_count++;
+        if (proton_rtv_attr_should_log(&s_iasetprim_counter, 1))
+        {
+            fprintf(stderr,
+                    "[STATE-PRIM] cmdlist=%p topology=%u\n",
+                    (void*)list, (unsigned)topology);
+            fflush(stderr);
+        }
+    }
+
     if (topology == D3D_PRIMITIVE_TOPOLOGY_UNDEFINED)
     {
         WARN("Ignoring D3D_PRIMITIVE_TOPOLOGY_UNDEFINED.\n");
@@ -11755,6 +11979,20 @@ static void STDMETHODCALLTYPE d3d12_command_list_RSSetViewports(d3d12_command_li
     unsigned int i;
 
     TRACE("iface %p, viewport_count %u, viewports %p.\n", iface, viewport_count, viewports);
+
+    /* [RTV-ATTR] log per-RSSetViewports attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_rsvp_counter = 0;
+        list->proton_rtv_attr_rsvp_count++;
+        if (proton_rtv_attr_should_log(&s_rsvp_counter, 1))
+        {
+            fprintf(stderr,
+                    "[STATE-VP] cmdlist=%p num=%u\n",
+                    (void*)list, viewport_count);
+            fflush(stderr);
+        }
+    }
 
     if (viewport_count > ARRAY_SIZE(dyn_state->viewports))
     {
@@ -11797,6 +12035,20 @@ static void STDMETHODCALLTYPE d3d12_command_list_RSSetScissorRects(d3d12_command
     unsigned int i;
 
     TRACE("iface %p, rect_count %u, rects %p.\n", iface, rect_count, rects);
+
+    /* [RTV-ATTR] log per-RSSetScissorRects attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_rssc_counter = 0;
+        list->proton_rtv_attr_rssc_count++;
+        if (proton_rtv_attr_should_log(&s_rssc_counter, 1))
+        {
+            fprintf(stderr,
+                    "[STATE-SC] cmdlist=%p num=%u\n",
+                    (void*)list, rect_count);
+            fflush(stderr);
+        }
+    }
 
     if (rect_count > ARRAY_SIZE(dyn_state->scissors))
     {
@@ -11881,6 +12133,25 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetPipelineState(d3d12_command_
     unsigned int i;
 
     TRACE("iface %p, pipeline_state %p.\n", iface, pipeline_state);
+
+    /* [DRAW-TRACE] count this SetPipelineState against the recording command list. */
+    if (vkd3d_trace_draw_enabled())
+        vkd3d_atomic_uint32_increment(&list->setpso_count_trace, vkd3d_memory_order_relaxed);
+
+    /* [RTV-ATTR] log per-SetPipelineState attribution. KCD2 menu-phase
+     * triage: does the title reach state-setup at all? */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_setpso_counter = 0;
+        list->proton_rtv_attr_setpso_count++;
+        if (proton_rtv_attr_should_log(&s_setpso_counter, 1))
+        {
+            fprintf(stderr,
+                    "[STATE-PSO] cmdlist=%p pso=%p\n",
+                    (void*)list, (void*)pipeline_state);
+            fflush(stderr);
+        }
+    }
 
     if ((TRACE_ON() || list->device->debug_ring.active) && state)
     {
@@ -12787,6 +13058,40 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
 
     TRACE("iface %p, barrier_count %u, barriers %p.\n", iface, barrier_count, barriers);
 
+    /* [DRAW-TRACE] count this barrier batch against the recording command list. */
+    if (vkd3d_trace_draw_enabled())
+    {
+        vkd3d_atomic_uint32_increment(&list->barrier_count_trace, vkd3d_memory_order_relaxed);
+
+        /* [DRAW-TRACE-CALLER] dump PE callstack on barriers in env-tunable window
+         * PROTON_BARRIER_TRACE_CALLER_FROM/TO. Barriers fire 25k+ cmdlists with
+         * up to 6,454 per cmdlist — denser than ClearRTV. Helps find call paths
+         * that DON'T go through sub_20E0698 (which we already characterized). */
+        {
+            static LONG s_barrier_stack_dumps = 0;
+            static LONG s_from = -1;
+            static LONG s_to = -1;
+            LONG n = InterlockedIncrement(&s_barrier_stack_dumps);
+            if (s_from < 0)
+            {
+                const char *from = getenv("PROTON_BARRIER_TRACE_CALLER_FROM");
+                const char *to = getenv("PROTON_BARRIER_TRACE_CALLER_TO");
+                s_from = from ? atol(from) : 50000;
+                s_to = to ? atol(to) : (s_from + 32);
+            }
+            if (n >= s_from && n < s_to)
+            {
+                void *frames[32];
+                USHORT captured = RtlCaptureStackBackTrace(0, 32, frames, NULL);
+                USHORT fi;
+                INFO("[DRAW-TRACE-CALLER] Barrier n=%ld list=%p count=%u captured=%u\n",
+                        n, list, barrier_count, captured);
+                for (fi = 0; fi < captured; fi++)
+                    INFO("[DRAW-TRACE-CALLER]   [%u] %p\n", fi, frames[fi]);
+            }
+        }
+    }
+
     d3d12_command_list_flush_dgc_batch(list);
     d3d12_command_list_end_current_render_pass(list, false);
     d3d12_command_list_end_transfer_batch(list);
@@ -13086,9 +13391,14 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
 static void STDMETHODCALLTYPE d3d12_command_list_ExecuteBundle(d3d12_command_list_iface *iface,
         ID3D12GraphicsCommandList *command_list)
 {
+    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
     struct d3d12_bundle *bundle;
 
     TRACE("iface %p, command_list %p.\n", iface, command_list);
+
+    /* [DRAW-TRACE] count this bundle execution against the recording command list. */
+    if (vkd3d_trace_draw_enabled())
+        vkd3d_atomic_uint32_increment(&list->bundle_count_trace, vkd3d_memory_order_relaxed);
 
     if (!(bundle = d3d12_bundle_from_iface(command_list)))
     {
@@ -13232,6 +13542,20 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetComputeRootSignature(d3d12_c
 
     TRACE("iface %p, root_signature %p.\n", iface, root_signature);
 
+    /* [RTV-ATTR] log per-SetComputeRootSignature attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_setrootsig_compute_counter = 0;
+        list->proton_rtv_attr_setrootsig_compute_count++;
+        if (proton_rtv_attr_should_log(&s_setrootsig_compute_counter, 1))
+        {
+            fprintf(stderr,
+                    "[STATE-ROOTSIG-COMPUTE] cmdlist=%p rootsig=%p\n",
+                    (void*)list, (void*)root_signature);
+            fflush(stderr);
+        }
+    }
+
     d3d12_command_list_set_root_signature(list, &list->compute_bindings,
             impl_from_ID3D12RootSignature(root_signature));
 
@@ -13246,6 +13570,24 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetGraphicsRootSignature(d3d12_
     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
 
     TRACE("iface %p, root_signature %p.\n", iface, root_signature);
+
+    /* [DRAW-TRACE] count this SetGraphicsRootSignature against the recording command list. */
+    if (vkd3d_trace_draw_enabled())
+        vkd3d_atomic_uint32_increment(&list->setrootsig_count_trace, vkd3d_memory_order_relaxed);
+
+    /* [RTV-ATTR] log per-SetGraphicsRootSignature attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_setrootsig_counter = 0;
+        list->proton_rtv_attr_setrootsig_count++;
+        if (proton_rtv_attr_should_log(&s_setrootsig_counter, 1))
+        {
+            fprintf(stderr,
+                    "[STATE-ROOTSIG] cmdlist=%p rootsig=%p\n",
+                    (void*)list, (void*)root_signature);
+            fflush(stderr);
+        }
+    }
 
     d3d12_command_list_set_root_signature(list, &list->graphics_bindings,
             impl_from_ID3D12RootSignature(root_signature));
@@ -13319,6 +13661,21 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetGraphicsRootDescriptorTable_
     TRACE("iface %p, root_parameter_index %u, base_descriptor %#"PRIx64".\n",
             iface, root_parameter_index, base_descriptor.ptr);
 
+    /* [RTV-ATTR] log per-SetGraphicsRootDescriptorTable attribution.
+     * 10x throttle: this fires many times per draw. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_setrootdesctbl_counter = 0;
+        list->proton_rtv_attr_setrootdesctbl_count++;
+        if (proton_rtv_attr_should_log(&s_setrootdesctbl_counter, 10))
+        {
+            fprintf(stderr,
+                    "[STATE-DESCTBL] cmdlist=%p root_param=%u\n",
+                    (void*)list, root_parameter_index);
+            fflush(stderr);
+        }
+    }
+
     d3d12_command_list_set_descriptor_table_embedded(list, &list->graphics_bindings,
             root_parameter_index, base_descriptor, 6, 4);
 }
@@ -13344,6 +13701,20 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetGraphicsRootDescriptorTable_
 
     TRACE("iface %p, root_parameter_index %u, base_descriptor %#"PRIx64".\n",
             iface, root_parameter_index, base_descriptor.ptr);
+
+    /* [RTV-ATTR] log per-SetGraphicsRootDescriptorTable attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_setrootdesctbl_counter = 0;
+        list->proton_rtv_attr_setrootdesctbl_count++;
+        if (proton_rtv_attr_should_log(&s_setrootdesctbl_counter, 10))
+        {
+            fprintf(stderr,
+                    "[STATE-DESCTBL] cmdlist=%p root_param=%u\n",
+                    (void*)list, root_parameter_index);
+            fflush(stderr);
+        }
+    }
 
     d3d12_command_list_set_descriptor_table_embedded(list, &list->graphics_bindings,
             root_parameter_index, base_descriptor, 5, 4);
@@ -13373,6 +13744,20 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetGraphicsRootDescriptorTable_
     TRACE("iface %p, root_parameter_index %u, base_descriptor %#"PRIx64".\n",
             iface, root_parameter_index, base_descriptor.ptr);
 
+    /* [RTV-ATTR] log per-SetGraphicsRootDescriptorTable attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_setrootdesctbl_counter = 0;
+        list->proton_rtv_attr_setrootdesctbl_count++;
+        if (proton_rtv_attr_should_log(&s_setrootdesctbl_counter, 10))
+        {
+            fprintf(stderr,
+                    "[STATE-DESCTBL] cmdlist=%p root_param=%u\n",
+                    (void*)list, root_parameter_index);
+            fflush(stderr);
+        }
+    }
+
     d3d12_command_list_set_descriptor_table_embedded(list, &list->graphics_bindings,
             root_parameter_index, base_descriptor,
             list->device->bindless_state.descriptor_buffer_cbv_srv_uav_size_log2,
@@ -13400,6 +13785,20 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetGraphicsRootDescriptorTable_
 
     TRACE("iface %p, root_parameter_index %u, base_descriptor %#"PRIx64".\n",
             iface, root_parameter_index, base_descriptor.ptr);
+
+    /* [RTV-ATTR] log per-SetGraphicsRootDescriptorTable attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_setrootdesctbl_counter = 0;
+        list->proton_rtv_attr_setrootdesctbl_count++;
+        if (proton_rtv_attr_should_log(&s_setrootdesctbl_counter, 10))
+        {
+            fprintf(stderr,
+                    "[STATE-DESCTBL] cmdlist=%p root_param=%u\n",
+                    (void*)list, root_parameter_index);
+            fflush(stderr);
+        }
+    }
 
     d3d12_command_list_set_descriptor_table(list, &list->graphics_bindings,
             root_parameter_index, base_descriptor);
@@ -13660,6 +14059,20 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
 
     TRACE("iface %p, view %p.\n", iface, view);
 
+    /* [RTV-ATTR] log per-IASetIndexBuffer attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_iasetib_counter = 0;
+        list->proton_rtv_attr_iasetib_count++;
+        if (proton_rtv_attr_should_log(&s_iasetib_counter, 1))
+        {
+            fprintf(stderr,
+                    "[STATE-IB] cmdlist=%p\n",
+                    (void*)list);
+            fflush(stderr);
+        }
+    }
+
     list->index_buffer.is_dirty = true;
 
     if (!view || view->SizeInBytes == 0)
@@ -13723,6 +14136,24 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_comman
     unsigned int i;
 
     TRACE("iface %p, start_slot %u, view_count %u, views %p.\n", iface, start_slot, view_count, views);
+
+    /* [DRAW-TRACE] count this IASetVertexBuffers against the recording command list. */
+    if (vkd3d_trace_draw_enabled())
+        vkd3d_atomic_uint32_increment(&list->setvb_count_trace, vkd3d_memory_order_relaxed);
+
+    /* [RTV-ATTR] log per-IASetVertexBuffers attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_iasetvb_counter = 0;
+        list->proton_rtv_attr_iasetvb_count++;
+        if (proton_rtv_attr_should_log(&s_iasetvb_counter, 1))
+        {
+            fprintf(stderr,
+                    "[STATE-VB] cmdlist=%p start_slot=%u num_views=%u\n",
+                    (void*)list, start_slot, view_count);
+            fflush(stderr);
+        }
+    }
 
     if (start_slot >= ARRAY_SIZE(dyn_state->vertex_strides) ||
             view_count > ARRAY_SIZE(dyn_state->vertex_strides) - start_slot)
@@ -14011,6 +14442,88 @@ static bool d3d12_command_list_filter_set_render_targets(struct d3d12_command_li
     return true;
 }
 
+/* [RTV-ATTR] Snapshot list->rtvs[] into list->proton_rtv_attr[]. Called
+ * from OMSetRenderTargets after list->rtvs is freshly populated. Resets
+ * draws_since_bind / verts_since_bind for each slot since they refer to
+ * the just-installed binding. */
+static void proton_rtv_attr_capture_binding(struct d3d12_command_list *list)
+{
+    unsigned int i;
+    if (!proton_rtv_attr_enabled())
+        return;
+
+    memset(list->proton_rtv_attr, 0, sizeof(list->proton_rtv_attr));
+    list->proton_rtv_attr_count = list->rendering_info.info.colorAttachmentCount;
+    if (list->proton_rtv_attr_count > ARRAY_SIZE(list->proton_rtv_attr))
+        list->proton_rtv_attr_count = ARRAY_SIZE(list->proton_rtv_attr);
+
+    for (i = 0; i < list->proton_rtv_attr_count; ++i)
+    {
+        const struct d3d12_rtv_desc *rtv = &list->rtvs[i];
+        if (!rtv->resource)
+            continue;
+        list->proton_rtv_attr[i].resource_id = rtv->resource->proton_resource_id;
+        list->proton_rtv_attr[i].format = rtv->format ? (uint32_t)rtv->format->dxgi_format : 0u;
+        list->proton_rtv_attr[i].width = rtv->width;
+        list->proton_rtv_attr[i].height = rtv->height;
+    }
+    list->proton_rtv_attr_total_binds++;
+}
+
+/* [RTV-ATTR] Attribute draw+vertex counts to every slot that currently
+ * holds a bound RTV. Called from the Draw / DrawIndexed / DrawIndirect
+ * paths. */
+static void proton_rtv_attr_count_draw(struct d3d12_command_list *list, uint64_t verts)
+{
+    unsigned int i;
+    if (!proton_rtv_attr_enabled())
+        return;
+    list->proton_rtv_attr_total_draws++;
+    for (i = 0; i < list->proton_rtv_attr_count; ++i)
+    {
+        if (!list->proton_rtv_attr[i].resource_id)
+            continue;
+        list->proton_rtv_attr[i].draws_since_bind++;
+        list->proton_rtv_attr[i].verts_since_bind += verts;
+    }
+}
+
+static void proton_rtv_attr_count_dispatch(struct d3d12_command_list *list)
+{
+    if (!proton_rtv_attr_enabled())
+        return;
+    list->proton_rtv_attr_total_dispatches++;
+}
+
+/* [RTV-ATTR] Throttle helper for non-draw GPU-command log lines (Clear*,
+ * Copy*, Resolve, Discard). Reads PROTON_VKD3D_RTV_ATTR_WARMUP /
+ * PROTON_VKD3D_RTV_ATTR_PERIOD once, caches them, then permits logging
+ * for the first `warmup` events and every `period`'th event thereafter.
+ * If `period_multiplier` > 1 the effective period is scaled up; buffer
+ * copies pass 10 because they fire constantly for upload heaps. */
+static bool proton_rtv_attr_should_log(uint32_t *counter, unsigned period_multiplier)
+{
+    static int s_warmup_cached = -1;
+    static int s_period_cached = -1;
+    unsigned warmup, period;
+    uint32_t n;
+
+    if (!proton_rtv_attr_enabled())
+        return false;
+
+    if (s_warmup_cached < 0)
+        s_warmup_cached = (int)vkd3d_env_var_as_uint("PROTON_VKD3D_RTV_ATTR_WARMUP", 50);
+    if (s_period_cached < 0)
+        s_period_cached = (int)vkd3d_env_var_as_uint("PROTON_VKD3D_RTV_ATTR_PERIOD", 2048);
+
+    warmup = (unsigned)s_warmup_cached;
+    period = (unsigned)s_period_cached * (period_multiplier ? period_multiplier : 1);
+    if (period == 0) period = 1;
+
+    n = vkd3d_atomic_uint32_increment(counter, vkd3d_memory_order_relaxed);
+    return (n <= warmup) || ((n - warmup) % period == 0);
+}
+
 static void STDMETHODCALLTYPE d3d12_command_list_OMSetRenderTargets(d3d12_command_list_iface *iface,
         UINT render_target_descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors,
         BOOL single_descriptor_handle, const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil_descriptor)
@@ -14024,6 +14537,95 @@ static void STDMETHODCALLTYPE d3d12_command_list_OMSetRenderTargets(d3d12_comman
             "single_descriptor_handle %#x, depth_stencil_descriptor %p.\n",
             iface, render_target_descriptor_count, render_target_descriptors,
             single_descriptor_handle, depth_stencil_descriptor);
+
+    /* [DRAW-TRACE] count this OMSetRenderTargets against the recording command list. */
+    if (vkd3d_trace_draw_enabled())
+        vkd3d_atomic_uint32_increment(&list->omrt_count_trace, vkd3d_memory_order_relaxed);
+
+    /* [RTV-PROBE] Log every OMRT call with full resource attributes so we
+     * can identify what offscreen target CryEngine renders into (KCD2
+     * black-screen investigation: backbuffer empty per BB-SAMPLE, so the
+     * draws must target some other RT). Throttle: log first N (default
+     * 1000) calls, then every Mth (default 256). Env knobs:
+     *   PROTON_VKD3D_RTV_PROBE_WARMUP  (default 1000)
+     *   PROTON_VKD3D_RTV_PROBE_PERIOD  (default 256)
+     * The global OMRT counter doubles as a sanity check: if total ends
+     * up zero, the renderer truly never bound any RT this session. */
+    if (vkd3d_trace_draw_enabled())
+    {
+        static int s_omrt_probe_warmup = -1;
+        static int s_omrt_probe_period = -1;
+        static LONG s_omrt_probe_count = 0;
+        LONG n;
+        unsigned warmup, period;
+
+        if (s_omrt_probe_warmup < 0)
+            s_omrt_probe_warmup = (int)vkd3d_env_var_as_uint("PROTON_VKD3D_RTV_PROBE_WARMUP", 1000);
+        if (s_omrt_probe_period < 0)
+            s_omrt_probe_period = (int)vkd3d_env_var_as_uint("PROTON_VKD3D_RTV_PROBE_PERIOD", 256);
+        warmup = (unsigned)s_omrt_probe_warmup;
+        period = (unsigned)s_omrt_probe_period;
+        if (period == 0) period = 1;
+
+        n = InterlockedIncrement(&s_omrt_probe_count);
+        if (n <= (LONG)warmup || (((LONG)n - (LONG)warmup) % (LONG)period == 0))
+        {
+            unsigned int j;
+            for (j = 0; j < render_target_descriptor_count; ++j)
+            {
+                const struct d3d12_rtv_desc *probe_rtv;
+                if (single_descriptor_handle)
+                    probe_rtv = d3d12_rtv_desc_from_cpu_handle(*render_target_descriptors);
+                else
+                    probe_rtv = d3d12_rtv_desc_from_cpu_handle(render_target_descriptors[j]);
+                if (single_descriptor_handle && probe_rtv) probe_rtv += j;
+                if (probe_rtv && probe_rtv->resource)
+                {
+                    const struct d3d12_resource *res = probe_rtv->resource;
+                    INFO("[RTV-PROBE] OMRT n=%ld list=%p slot=%u rcount=%u id=%u "
+                         "vk_image=%p dxgi_fmt=%u dims=%llux%ux%u samples=%u "
+                         "mips=%u arr=%u flags=0x%x heap=%d rtv_fmt=%u rtv_dims=%ux%u\n",
+                        n, list, j, render_target_descriptor_count,
+                        res->proton_resource_id,
+                        (void*)res->res.vk_image,
+                        (unsigned)res->desc.Format,
+                        (unsigned long long)res->desc.Width,
+                        (unsigned)res->desc.Height,
+                        (unsigned)res->desc.DepthOrArraySize,
+                        (unsigned)res->desc.SampleDesc.Count,
+                        (unsigned)res->desc.MipLevels,
+                        (unsigned)res->desc.DepthOrArraySize,
+                        (unsigned)res->desc.Flags,
+                        (int)res->heap_properties.Type,
+                        probe_rtv->format ? (unsigned)probe_rtv->format->dxgi_format : 0u,
+                        (unsigned)probe_rtv->width,
+                        (unsigned)probe_rtv->height);
+                }
+                else
+                {
+                    INFO("[RTV-PROBE] OMRT n=%ld list=%p slot=%u rcount=%u resource=NULL\n",
+                        n, list, j, render_target_descriptor_count);
+                }
+            }
+            if (depth_stencil_descriptor)
+            {
+                const struct d3d12_rtv_desc *probe_dsv = d3d12_rtv_desc_from_cpu_handle(*depth_stencil_descriptor);
+                if (probe_dsv && probe_dsv->resource)
+                {
+                    const struct d3d12_resource *res = probe_dsv->resource;
+                    INFO("[RTV-PROBE] OMRT n=%ld list=%p DSV id=%u vk_image=%p dxgi_fmt=%u dims=%llux%u samples=%u flags=0x%x heap=%d\n",
+                        n, list, res->proton_resource_id,
+                        (void*)res->res.vk_image,
+                        (unsigned)res->desc.Format,
+                        (unsigned long long)res->desc.Width,
+                        (unsigned)res->desc.Height,
+                        (unsigned)res->desc.SampleDesc.Count,
+                        (unsigned)res->desc.Flags,
+                        (int)res->heap_properties.Type);
+                }
+            }
+        }
+    }
 
     d3d12_command_list_check_render_pass_validation(list, "OMSetRenderTargets called within a render pass.\n", false);
     d3d12_command_list_flush_dgc_batch(list);
@@ -14096,6 +14698,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_OMSetRenderTargets(d3d12_comman
 
     d3d12_command_list_invalidate_ds_state(list, prev_dsv_format);
     d3d12_command_list_recompute_fb_size(list);
+
+    /* [RTV-ATTR] capture the freshly-installed binding for per-cmdlist
+     * draw attribution. Cheap (env-gated) when feature is off. */
+    proton_rtv_attr_capture_binding(list);
 }
 
 static bool d3d12_rect_fully_covers_region(const D3D12_RECT *a, const D3D12_RECT *b)
@@ -14322,6 +14928,23 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearDepthStencilView(d3d12_com
     TRACE("iface %p, dsv %#lx, flags %#x, depth %.8e, stencil 0x%02x, rect_count %u, rects %p.\n",
             iface, dsv.ptr, flags, depth, stencil, rect_count, rects);
 
+    /* [RTV-ATTR] log per-DSV-clear attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_clear_dsv_log_counter = 0;
+        uint32_t dsv_resource_id = 0;
+        list->proton_rtv_attr_clear_dsv_count++;
+        if (dsv_desc && dsv_desc->resource)
+            dsv_resource_id = dsv_desc->resource->proton_resource_id;
+        if (proton_rtv_attr_should_log(&s_clear_dsv_log_counter, 1))
+        {
+            fprintf(stderr,
+                    "[RTV-ATTR-CLEAR-DSV] cmdlist=%p dsv_resource_id=%u depth=%.3f stencil=%u flags=0x%x\n",
+                    (void*)list, dsv_resource_id, depth, (unsigned)stencil, (unsigned)flags);
+            fflush(stderr);
+        }
+    }
+
     d3d12_command_list_check_render_pass_validation(list, "ClearDepthStencilView called within a render pass.\n", true);
     d3d12_command_list_flush_dgc_batch(list);
 
@@ -14435,6 +15058,65 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearRenderTargetView(d3d12_com
 
     TRACE("iface %p, rtv %#lx, color %p, rect_count %u, rects %p.\n",
             iface, rtv.ptr, color, rect_count, rects);
+
+    /* [DRAW-TRACE] count this clear against the recording command list. */
+    if (vkd3d_trace_draw_enabled())
+    {
+        vkd3d_atomic_uint32_increment(&list->clear_count_trace, vkd3d_memory_order_relaxed);
+
+        /* [DRAW-TRACE-CALLER] dump PE callstack on selected ClearRTV calls per process.
+         * First 8 ClearRTV calls in KCD2 are CryEngine renderer-init (sub_A6B1AC) which
+         * is init-only-by-design — no OMSetRenderTargets/Draw follows by design. To
+         * catch the steady-state per-frame path we sample at indexes after init has
+         * completed. Window is env-tunable via PROTON_DRAW_TRACE_CALLER_FROM/TO. */
+        {
+            static LONG s_clear_stack_dumps = 0;
+            static LONG s_skip_below = -1;
+            static LONG s_skip_above = -1;
+            LONG n = InterlockedIncrement(&s_clear_stack_dumps);
+            if (s_skip_below < 0)
+            {
+                const char *from = getenv("PROTON_DRAW_TRACE_CALLER_FROM");
+                const char *to = getenv("PROTON_DRAW_TRACE_CALLER_TO");
+                s_skip_below = from ? atol(from) : 5000;
+                s_skip_above = to ? atol(to) : (s_skip_below + 8);
+            }
+            if (n >= s_skip_below && n < s_skip_above)
+            {
+                void *frames[32];
+                USHORT captured = RtlCaptureStackBackTrace(0, 32, frames, NULL);
+                USHORT fi;
+                INFO("[DRAW-TRACE-CALLER] ClearRTV n=%ld list=%p rtv=%#lx captured=%u\n",
+                        n, list, (unsigned long)rtv.ptr, captured);
+                for (fi = 0; fi < captured; fi++)
+                    INFO("[DRAW-TRACE-CALLER]   [%u] %p\n", fi, frames[fi]);
+            }
+        }
+    }
+
+    /* [RTV-ATTR] log per-clear attribution. Throttled per the standard
+     * warmup/period env knobs. Resolves the RTV handle to the underlying
+     * resource so the id matches what we logged at create time. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_clear_rtv_log_counter = 0;
+        uint32_t rtv_resource_id = 0;
+        list->proton_rtv_attr_clear_rtv_count++;
+        if (rtv_desc && rtv_desc->resource)
+            rtv_resource_id = rtv_desc->resource->proton_resource_id;
+        if (proton_rtv_attr_should_log(&s_clear_rtv_log_counter, 1))
+        {
+            void *ret0 = __builtin_return_address(0);
+            void *ret1 = __builtin_return_address(1);
+            fprintf(stderr,
+                    "[RTV-ATTR-CLEAR] cmdlist=%p rtv_resource_id=%u color=(%.2f,%.2f,%.2f,%.2f) ret_addr=%p ret_addr_outer=%p\n",
+                    (void*)list, rtv_resource_id,
+                    color ? color[0] : 0.0f, color ? color[1] : 0.0f,
+                    color ? color[2] : 0.0f, color ? color[3] : 0.0f,
+                    ret0, ret1);
+            fflush(stderr);
+        }
+    }
 
     d3d12_command_list_check_render_pass_validation(list, "ClearRenderTargetView called within a render pass.\n", true);
     d3d12_command_list_flush_dgc_batch(list);
@@ -15323,6 +16005,21 @@ static void STDMETHODCALLTYPE d3d12_command_list_DiscardResource(d3d12_command_l
     bool full_discard;
 
     TRACE("iface %p, resource %p, region %p.\n", iface, resource, region);
+
+    /* [RTV-ATTR] log per-DiscardResource attribution. */
+    if (proton_rtv_attr_enabled())
+    {
+        static uint32_t s_discard_log_counter = 0;
+        list->proton_rtv_attr_discard_count++;
+        if (proton_rtv_attr_should_log(&s_discard_log_counter, 1))
+        {
+            uint32_t res_id = texture ? texture->proton_resource_id : 0;
+            fprintf(stderr,
+                    "[RTV-ATTR-DISCARD] cmdlist=%p resource_id=%u\n",
+                    (void*)list, res_id);
+            fflush(stderr);
+        }
+    }
 
     d3d12_command_list_check_render_pass_validation(list, "DiscardResource called within a render pass.\n", true);
     d3d12_command_list_flush_dgc_batch(list);
@@ -16777,6 +17474,14 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
             "arg_buffer_offset %#"PRIx64", count_buffer %p, count_buffer_offset %#"PRIx64".\n",
             iface, command_signature, max_command_count, arg_buffer, arg_buffer_offset,
             count_buffer, count_buffer_offset);
+
+    /* [DRAW-TRACE] count this indirect execution against the recording command list. */
+    if (vkd3d_trace_draw_enabled())
+        vkd3d_atomic_uint32_increment(&list->indirect_count_trace, vkd3d_memory_order_relaxed);
+
+    /* [RTV-ATTR] indirect counts as one draw against bound RTVs; vertex
+     * count is GPU-side so report as 0. */
+    proton_rtv_attr_count_draw(list, 0);
 
     if (!max_command_count)
         return;
@@ -20012,6 +20717,14 @@ static void STDMETHODCALLTYPE d3d12_command_list_DispatchMesh(d3d12_command_list
     struct vkd3d_scratch_allocation scratch;
 
     TRACE("iface %p, x %u, y %u, z %u.\n", iface, x, y, z);
+
+    /* [DRAW-TRACE] count this mesh dispatch against the recording command list. */
+    if (vkd3d_trace_draw_enabled())
+        vkd3d_atomic_uint32_increment(&list->mesh_count_trace, vkd3d_memory_order_relaxed);
+
+    /* [RTV-ATTR] mesh-shader draw counts as one draw against bound RTVs;
+     * vertex count is GPU-side so report as 0. */
+    proton_rtv_attr_count_draw(list, 0);
 
     d3d12_command_list_flush_dgc_batch(list);
 

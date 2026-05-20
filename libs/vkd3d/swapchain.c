@@ -763,6 +763,16 @@ static HRESULT dxgi_vk_swap_chain_reallocate_user_buffers(struct dxgi_vk_swap_ch
         vkd3d_resource_incref((ID3D12Resource *)&chain->user.backbuffers[i]->ID3D12Resource_iface);
         ID3D12Resource2_Release(&chain->user.backbuffers[i]->ID3D12Resource_iface);
 
+        /* [RTV-PROBE] Log swap chain backbuffer resource pointers. Cross-
+         * reference with [RTV-PROBE] OMRT lines to determine if the game
+         * ever binds the swap chain image as a render target. KCD2 black-
+         * screen hypothesis: it never does. Unconditional log; this only
+         * fires once per backbuffer at swap chain init. */
+        INFO("[RTV-PROBE] swap_chain backbuffer[%u] resource=%p vk_image=%p iface=%p\n",
+            i, chain->user.backbuffers[i],
+            (void*)chain->user.backbuffers[i]->res.vk_image,
+            &chain->user.backbuffers[i]->ID3D12Resource_iface);
+
         view_info.format = chain->user.backbuffers[i]->format->vk_format;
         view_info.image = chain->user.backbuffers[i]->res.vk_image;
         vr = VK_CALL(vkCreateImageView(chain->queue->device->vk_device, &view_info, NULL, &chain->user.vk_image_views[i]));
@@ -1900,6 +1910,27 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
     if (!dxgi_vk_swap_chain_select_format(chain, &surface_format))
         return;
 
+    /* [KCD2-TEST] PROTON_VKD3D_FORCE_SWAP_FORMAT - bytes-prefix selects format:
+     * "srgb_bgra" → VK_FORMAT_B8G8R8A8_SRGB (50)
+     * "srgb_rgba" → VK_FORMAT_R8G8B8A8_SRGB (43)
+     * "unorm_bgra" → VK_FORMAT_B8G8R8A8_UNORM (44, default-ish)
+     * Hypothesis: KCD2 black-screen is UNORM/SRGB-colorspace gamma mismatch. */
+    {
+        const char *fv = getenv("PROTON_VKD3D_FORCE_SWAP_FORMAT");
+        if (fv && fv[0]) {
+            VkFormat want = surface_format.format;
+            if (!strcmp(fv, "srgb_bgra")) want = VK_FORMAT_B8G8R8A8_SRGB;
+            else if (!strcmp(fv, "srgb_rgba")) want = VK_FORMAT_R8G8B8A8_SRGB;
+            else if (!strcmp(fv, "unorm_bgra")) want = VK_FORMAT_B8G8R8A8_UNORM;
+            else if (!strcmp(fv, "unorm_rgba")) want = VK_FORMAT_R8G8B8A8_UNORM;
+            VkSurfaceFormatKHR override = surface_format;
+            override.format = want;
+            INFO("[KCD2-TEST] PROTON_VKD3D_FORCE_SWAP_FORMAT=%s -> vkFormat %u (was %u)\n",
+                fv, (unsigned)want, (unsigned)surface_format.format);
+            surface_format = override;
+        }
+    }
+
     memset(&swapchain_create_info, 0, sizeof(swapchain_create_info));
     swapchain_create_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
 
@@ -1966,7 +1997,27 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
     swapchain_create_info.imageFormat = surface_format.format;
     swapchain_create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    swapchain_create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    INFO("[KCD2-TEST] swapchain config: vkFormat=%u colorSpace=%u presentMode=%u surface=%p\n",
+        surface_format.format, surface_format.colorSpace,
+        chain->present.selected_present_mode, (void*)swapchain_create_info.surface);
+    /* [KCD2-TEST] Hypothesis: hardwired OPAQUE compositeAlpha + MoltenVK's
+     * framebufferOnly=YES + CryEngine clear color=(0,0,0,0) → fully opaque
+     * black on Apple Silicon. Env-gated A/B test.
+     * PROTON_VKD3D_COMPOSITE_ALPHA: 0=opaque (default), 1=post-multiplied,
+     * 2=pre-multiplied, 3=inherit. */
+    {
+        const char *v = getenv("PROTON_VKD3D_COMPOSITE_ALPHA");
+        VkCompositeAlphaFlagBitsKHR ca = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        if (v && v[0]) {
+            switch (v[0]) {
+                case '1': ca = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR; break;
+                case '2': ca = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR; break;
+                case '3': ca = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR; break;
+            }
+            INFO("[KCD2-TEST] compositeAlpha overridden via PROTON_VKD3D_COMPOSITE_ALPHA=%s -> 0x%x\n", v, ca);
+        }
+        swapchain_create_info.compositeAlpha = ca;
+    }
     swapchain_create_info.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     swapchain_create_info.presentMode = chain->present.selected_present_mode;
     swapchain_create_info.clipped = VK_TRUE;
@@ -2135,6 +2186,122 @@ static void dxgi_vk_swap_chain_present_signal_blit_semaphore(struct dxgi_vk_swap
     }
 }
 
+/* [KCD2-TEST] PROTON_VKD3D_BB_SAMPLE=1 — sample a 32x32 region from the center
+ * of the user_backbuffer just before the BLIT to discriminate "renderer wrote
+ * to user_backbuffer but composite failed" from "user_backbuffer is genuinely
+ * empty when present fires". Logs per-channel min/max/sum + nonzero count.
+ * Throttled by PROTON_VKD3D_BB_SAMPLE_PERIOD (default 60 frames). Diagnostic
+ * only — leaks the buffer on swapchain destruction; KCD2 keeps one chain. */
+#define PROTON_BB_SAMPLE_W 32
+#define PROTON_BB_SAMPLE_H 32
+#define PROTON_BB_SAMPLE_BYTES (PROTON_BB_SAMPLE_W * PROTON_BB_SAMPLE_H * 4)
+
+static struct proton_bb_sample_state {
+    int cached_enable;
+    int cached_period;
+    int cached_warmup;
+    int inited;
+    int format_logged;
+    uint32_t mem_type_index;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    void *mapped;
+    uint64_t pending_timeline;
+    uint32_t pending_seq;
+} s_bb_sample = { -1, -1, -1, 0, 0, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, NULL, 0, 0 };
+
+static bool proton_bb_sample_enabled(void)
+{
+    if (s_bb_sample.cached_enable < 0)
+    {
+        const char *v = getenv("PROTON_VKD3D_BB_SAMPLE");
+        s_bb_sample.cached_enable = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+        v = getenv("PROTON_VKD3D_BB_SAMPLE_PERIOD");
+        s_bb_sample.cached_period = (v && *v) ? atoi(v) : 60;
+        if (s_bb_sample.cached_period < 1) s_bb_sample.cached_period = 1;
+        v = getenv("PROTON_VKD3D_BB_SAMPLE_WARMUP");
+        s_bb_sample.cached_warmup = (v && *v) ? atoi(v) : 0;
+    }
+    return s_bb_sample.cached_enable != 0;
+}
+
+static bool proton_bb_sample_init(struct dxgi_vk_swap_chain *chain)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+    VkDevice vk_device = chain->queue->device->vk_device;
+    const VkPhysicalDeviceMemoryProperties *mp = &chain->queue->device->memory_properties;
+    VkMemoryAllocateInfo alloc_info;
+    VkMemoryRequirements mreq;
+    VkBufferCreateInfo bci;
+    uint32_t i, chosen;
+    VkResult vr;
+
+    if (s_bb_sample.inited) return true;
+
+    memset(&bci, 0, sizeof(bci));
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = PROTON_BB_SAMPLE_BYTES;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    vr = VK_CALL(vkCreateBuffer(vk_device, &bci, NULL, &s_bb_sample.buffer));
+    if (vr < 0) { ERR("[BB-SAMPLE] vkCreateBuffer vr=%d\n", vr); return false; }
+
+    VK_CALL(vkGetBufferMemoryRequirements(vk_device, s_bb_sample.buffer, &mreq));
+
+    chosen = UINT32_MAX;
+    for (i = 0; i < mp->memoryTypeCount; ++i)
+    {
+        if (!((mreq.memoryTypeBits >> i) & 1u)) continue;
+        if ((mp->memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        {
+            chosen = i;
+            break;
+        }
+    }
+    if (chosen == UINT32_MAX)
+    {
+        ERR("[BB-SAMPLE] no HOST_VISIBLE|HOST_COHERENT memory type matching mask 0x%x\n", mreq.memoryTypeBits);
+        VK_CALL(vkDestroyBuffer(vk_device, s_bb_sample.buffer, NULL));
+        s_bb_sample.buffer = VK_NULL_HANDLE;
+        return false;
+    }
+
+    memset(&alloc_info, 0, sizeof(alloc_info));
+    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.allocationSize = mreq.size;
+    alloc_info.memoryTypeIndex = chosen;
+    vr = VK_CALL(vkAllocateMemory(vk_device, &alloc_info, NULL, &s_bb_sample.memory));
+    if (vr < 0)
+    {
+        ERR("[BB-SAMPLE] vkAllocateMemory vr=%d\n", vr);
+        VK_CALL(vkDestroyBuffer(vk_device, s_bb_sample.buffer, NULL));
+        s_bb_sample.buffer = VK_NULL_HANDLE;
+        return false;
+    }
+
+    {
+        VkBindBufferMemoryInfo bind_info;
+        memset(&bind_info, 0, sizeof(bind_info));
+        bind_info.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
+        bind_info.buffer = s_bb_sample.buffer;
+        bind_info.memory = s_bb_sample.memory;
+        bind_info.memoryOffset = 0;
+        vr = VK_CALL(vkBindBufferMemory2(vk_device, 1, &bind_info));
+        if (vr < 0) { ERR("[BB-SAMPLE] vkBindBufferMemory2 vr=%d\n", vr); return false; }
+    }
+    vr = VK_CALL(vkMapMemory(vk_device, s_bb_sample.memory, 0, mreq.size, 0, &s_bb_sample.mapped));
+    if (vr < 0) { ERR("[BB-SAMPLE] vkMapMemory vr=%d\n", vr); return false; }
+
+    memset(s_bb_sample.mapped, 0xCD, PROTON_BB_SAMPLE_BYTES);
+    s_bb_sample.mem_type_index = chosen;
+    s_bb_sample.inited = 1;
+    INFO("[BB-SAMPLE] init OK buf=%p mem=%p mapped=%p mem_type=%u size=%u\n",
+         (void*)s_bb_sample.buffer, (void*)s_bb_sample.memory, s_bb_sample.mapped,
+         chosen, (unsigned)PROTON_BB_SAMPLE_BYTES);
+    return true;
+}
+
 static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *chain, VkCommandBuffer vk_cmd, uint32_t swapchain_index)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
@@ -2196,6 +2363,37 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
     blit_command = !blank_present &&
             viewport.width == (float)chain->present.backbuffer_width &&
             viewport.height == (float)chain->present.backbuffer_height;
+
+    /* [KCD2-TEST] PROTON_VKD3D_FORCE_DRAW_PRESENT=1 disables the blit
+     * fast-path and forces the shader-based fullscreen-triangle present
+     * even when sizes match. Discriminates "blit silently broken" vs
+     * "user_backbuffer empty". */
+    {
+        static int cached_force_draw = -1;
+        if (cached_force_draw < 0) {
+            const char *v = getenv("PROTON_VKD3D_FORCE_DRAW_PRESENT");
+            cached_force_draw = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+        }
+        if (cached_force_draw && blit_command) blit_command = false;
+    }
+
+    /* [PRESENT-PATH] log path + sizes + user_index at every present so we
+     * can verify CryEngine-written user_backbuffer reaches MoltenVK swap
+     * chain image. KCD2 black-screen lives somewhere between OMRT (which
+     * we proved targets the right backbuffer) and the final layer
+     * contents. */
+    {
+        static LONG s_pp_count = 0;
+        LONG n = InterlockedIncrement(&s_pp_count);
+        if (n <= 5 || (n & 0xFF) == 0)
+            INFO("[PRESENT-PATH] n=%ld user_idx=%u sc_idx=%u blank=%d path=%s viewport=%gx%g backbuffer=%ux%u user_bb_vk=%p sc_vk=%p\n",
+                n, chain->request.user_index, swapchain_index, (int)blank_present,
+                blit_command ? "BLIT" : "DRAW",
+                viewport.width, viewport.height,
+                chain->present.backbuffer_width, chain->present.backbuffer_height,
+                (void*)chain->user.backbuffers[chain->request.user_index]->res.vk_image,
+                (void*)chain->present.vk_backbuffer_images[swapchain_index]);
+    }
 
     memset(&dep_info, 0, sizeof(dep_info));
     dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -2259,6 +2457,87 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
 
     VK_CALL(vkCmdPipelineBarrier2(vk_cmd, &dep_info));
 
+    /* [BB-SAMPLE] copy a 32x32 region from the CENTER of user_backbuffer
+     * to a host-visible buffer for CPU readback in submit_blit. Only runs
+     * in the blit_command path (user_backbuffer is in TRANSFER_SRC_OPTIMAL
+     * after the barrier above). Throttled by warmup + period. */
+    if (blit_command && proton_bb_sample_enabled() && proton_bb_sample_init(chain))
+    {
+        static uint32_t s_bb_call_count = 0;
+        uint32_t n = ++s_bb_call_count;
+        if (n > (uint32_t)s_bb_sample.cached_warmup &&
+            ((n - s_bb_sample.cached_warmup - 1) % (uint32_t)s_bb_sample.cached_period) == 0)
+        {
+            VkCopyImageToBufferInfo2 copy_info;
+            VkBufferImageCopy2 region;
+            uint32_t bw = chain->present.backbuffer_width;
+            uint32_t bh = chain->present.backbuffer_height;
+            int32_t ox = (bw >= PROTON_BB_SAMPLE_W) ? (int32_t)((bw - PROTON_BB_SAMPLE_W) / 2) : 0;
+            int32_t oy = (bh >= PROTON_BB_SAMPLE_H) ? (int32_t)((bh - PROTON_BB_SAMPLE_H) / 2) : 0;
+            uint32_t w = (bw >= PROTON_BB_SAMPLE_W) ? PROTON_BB_SAMPLE_W : bw;
+            uint32_t h = (bh >= PROTON_BB_SAMPLE_H) ? PROTON_BB_SAMPLE_H : bh;
+
+            if (!s_bb_sample.format_logged)
+            {
+                INFO("[BB-SAMPLE] user_backbuffer vk_format=%d backbuffer=%ux%u sample=%ux%u@(%d,%d)\n",
+                     user_backbuffer->format ? (int)user_backbuffer->format->vk_format : -1,
+                     bw, bh, w, h, ox, oy);
+                s_bb_sample.format_logged = 1;
+            }
+
+            memset(&region, 0, sizeof(region));
+            region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageOffset.x = ox;
+            region.imageOffset.y = oy;
+            region.imageExtent.width = w;
+            region.imageExtent.height = h;
+            region.imageExtent.depth = 1;
+
+            memset(&copy_info, 0, sizeof(copy_info));
+            copy_info.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2;
+            copy_info.srcImage = user_backbuffer->res.vk_image;
+            copy_info.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            copy_info.dstBuffer = s_bb_sample.buffer;
+            copy_info.regionCount = 1;
+            copy_info.pRegions = &region;
+            VK_CALL(vkCmdCopyImageToBuffer2(vk_cmd, &copy_info));
+            s_bb_sample.pending_seq = n;
+            /* timeline value set by submit_blit after vkQueueSubmit2 increments internal_blit_count */
+            s_bb_sample.pending_timeline = chain->present.internal_blit_count + 1;
+        }
+    }
+
+    /* [KCD2-TEST] PROTON_VKD3D_PRESENT_RED=1: clear sc_vk to bright red,
+     * bypass all user_bb access. If wine window turns red → presents
+     * reach the layer (user_bb was empty / write path broken). If still
+     * black → MoltenVK presents themselves never reach the visible
+     * layer (deeper bug). Only effective in the blit_command code path
+     * (sc_vk is in TRANSFER_DST_OPTIMAL); fall through to no-op
+     * otherwise so test stays simple. */
+    {
+        static int cached_red = -1;
+        if (cached_red < 0) {
+            const char *v = getenv("PROTON_VKD3D_PRESENT_RED");
+            cached_red = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+        }
+        if (cached_red && blit_command) {
+            VkClearColorValue cc;
+            VkImageSubresourceRange range;
+            cc.float32[0] = 1.0f; cc.float32[1] = 0.0f; cc.float32[2] = 0.0f; cc.float32[3] = 1.0f;
+            memset(&range, 0, sizeof(range));
+            range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            range.levelCount = 1;
+            range.layerCount = 1;
+            VK_CALL(vkCmdClearColorImage(vk_cmd,
+                chain->present.vk_backbuffer_images[swapchain_index],
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &range));
+            /* Skip the blit; the clear is enough to test. */
+            goto skip_blit_for_red_test;
+        }
+    }
+
     if (blit_command)
     {
         VkImageBlit blit;
@@ -2316,6 +2595,38 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
         }
 
         VK_CALL(vkCmdEndRendering(vk_cmd));
+    }
+
+skip_blit_for_red_test:
+    /* [KCD2-TEST] PROTON_VKD3D_POST_BLIT_CLEAR=1: after BLIT (or DRAW) writes
+     * sc_vk, overwrite with a distinctive dark-blue opaque color (R=0, G=0,
+     * B=0.5, A=1.0). Tests the alpha=0 hypothesis: if window turns DARK BLUE,
+     * the present chain reaches the visible layer when alpha=1 — proving the
+     * black symptom is caused by CryEngine's alpha=0 clear surviving the
+     * BLIT and confusing the WindowServer compositor. If window stays BLACK,
+     * the post-BLIT clear isn't reaching the visible layer (bug is elsewhere).
+     * Distinctive color avoids confusion with PROTON_VKD3D_PRESENT_RED. Only
+     * effective in the blit_command code path (sc_vk in TRANSFER_DST_OPTIMAL
+     * after BLIT). DRAW path has its own present write; clear after that
+     * would need separate layout transition. */
+    {
+        static int cached_post_blit_clear = -1;
+        if (cached_post_blit_clear < 0) {
+            const char *v = getenv("PROTON_VKD3D_POST_BLIT_CLEAR");
+            cached_post_blit_clear = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+        }
+        if (cached_post_blit_clear && blit_command) {
+            VkClearColorValue cc;
+            VkImageSubresourceRange range;
+            cc.float32[0] = 0.0f; cc.float32[1] = 0.0f; cc.float32[2] = 0.5f; cc.float32[3] = 1.0f;
+            memset(&range, 0, sizeof(range));
+            range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            range.levelCount = 1;
+            range.layerCount = 1;
+            VK_CALL(vkCmdClearColorImage(vk_cmd,
+                chain->present.vk_backbuffer_images[swapchain_index],
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &range));
+        }
     }
 
     if (blit_command)
@@ -2468,6 +2779,61 @@ static bool dxgi_vk_swap_chain_submit_blit(struct dxgi_vk_swap_chain *chain, uin
         chain->present.acquire_semaphore_consumed_at_blit[chain->present.acquire_semaphore_index] =
                 chain->present.internal_blit_count;
         chain->present.acquire_semaphore_signalled[chain->present.acquire_semaphore_index] = false;
+    }
+
+    /* [BB-SAMPLE] If record_render_pass queued a copy into our host-visible
+     * buffer, wait for that submission to complete and log the contents. The
+     * timeline value we want is the one we just incremented for this submit. */
+    if (vr == VK_SUCCESS && s_bb_sample.inited && s_bb_sample.pending_seq != 0)
+    {
+        uint64_t wait_value = chain->present.internal_blit_count;
+        uint32_t seq = s_bb_sample.pending_seq;
+        s_bb_sample.pending_seq = 0;
+        s_bb_sample.pending_timeline = 0;
+
+        dxgi_vk_swap_chain_drain_internal_blit_semaphore(chain, wait_value);
+
+        {
+            const uint8_t *p = (const uint8_t*)s_bb_sample.mapped;
+            uint64_t sumR = 0, sumG = 0, sumB = 0, sumA = 0;
+            uint32_t nonzero_rgb = 0;
+            uint32_t alpha_zero = 0, alpha_full = 0;
+            uint8_t minR = 255, minG = 255, minB = 255, minA = 255;
+            uint8_t maxR = 0, maxG = 0, maxB = 0, maxA = 0;
+            uint32_t total = PROTON_BB_SAMPLE_W * PROTON_BB_SAMPLE_H;
+            uint32_t i;
+            for (i = 0; i < total; ++i)
+            {
+                uint8_t r = p[i*4 + 0];
+                uint8_t g = p[i*4 + 1];
+                uint8_t b = p[i*4 + 2];
+                uint8_t a = p[i*4 + 3];
+                sumR += r; sumG += g; sumB += b; sumA += a;
+                if (r | g | b) ++nonzero_rgb;
+                if (a == 0) ++alpha_zero;
+                if (a == 255) ++alpha_full;
+                if (r < minR) minR = r;
+                if (r > maxR) maxR = r;
+                if (g < minG) minG = g;
+                if (g > maxG) maxG = g;
+                if (b < minB) minB = b;
+                if (b > maxB) maxB = b;
+                if (a < minA) minA = a;
+                if (a > maxA) maxA = a;
+            }
+            INFO("[BB-SAMPLE] seq=%u tl=%llu N=%u nonzeroRGB=%u a0=%u a255=%u "
+                 "R[%u..%u avg=%u] G[%u..%u avg=%u] B[%u..%u avg=%u] A[%u..%u avg=%u] "
+                 "px0=%02x%02x%02x%02x px_mid=%02x%02x%02x%02x px_last=%02x%02x%02x%02x\n",
+                 seq, (unsigned long long)wait_value, total, nonzero_rgb, alpha_zero, alpha_full,
+                 minR, maxR, (unsigned)(sumR/total),
+                 minG, maxG, (unsigned)(sumG/total),
+                 minB, maxB, (unsigned)(sumB/total),
+                 minA, maxA, (unsigned)(sumA/total),
+                 p[0], p[1], p[2], p[3],
+                 p[(total/2)*4 + 0], p[(total/2)*4 + 1], p[(total/2)*4 + 2], p[(total/2)*4 + 3],
+                 p[(total-1)*4 + 0], p[(total-1)*4 + 1], p[(total-1)*4 + 2], p[(total-1)*4 + 3]);
+            (void)wait_value;
+        }
     }
 
     return vr == VK_SUCCESS;

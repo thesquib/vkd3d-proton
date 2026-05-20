@@ -34,6 +34,41 @@
 static UINT global_cookie_counter;
 static UINT global_cookie_va_timestamp;
 
+/* [RTV-ATTR] Global counter feeding struct d3d12_resource::proton_resource_id.
+ * Starts at 0; the first resource returned by d3d12_resource_create gets id=1.
+ * Resource id 0 is reserved for "unknown / not yet tagged". */
+static uint32_t proton_resource_counter;
+
+/* [RTV-ATTR] Env-gated; cached after first lookup. Pattern mirrors
+ * PROTON_VKD3D_PRESENT_RED in libs/vkd3d/swapchain.c. Hot path is one
+ * branch on a static int once warmed. */
+bool proton_rtv_attr_enabled(void);
+bool proton_rtv_attr_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv("PROTON_VKD3D_RTV_ATTR");
+        cached = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/* [PSO-TRACE] PROTON_VKD3D_PSO_TRACE=1 enables d3d12_pipeline_state_create entry/exit logging.
+ * Used by state.c. KCD2 investigation: discriminates "engine never calls Create*" from
+ * "Create* fails silently" from "Create* succeeds but PSO never bound". */
+bool proton_pso_trace_enabled(void);
+bool proton_pso_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv("PROTON_VKD3D_PSO_TRACE");
+        cached = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static bool d3d12_resource_supports_small_resource_alignment(const D3D12_RESOURCE_DESC1 *desc,
         const struct vkd3d_format *format);
 
@@ -4128,6 +4163,28 @@ static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags
 
     vkd3d_descriptor_debug_register_resource_cookie(device->descriptor_qa_global_info,
             object->res.cookie, desc);
+
+    /* [RTV-ATTR] Stamp a stable id and emit a one-time create log so a
+     * post-process script can map id -> dimensions/format/flags later. */
+    object->proton_resource_id = vkd3d_atomic_uint32_increment(&proton_resource_counter,
+            vkd3d_memory_order_relaxed);
+    if (proton_rtv_attr_enabled())
+    {
+        D3D12_HEAP_TYPE heap_type = heap_properties ? heap_properties->Type : (D3D12_HEAP_TYPE)0;
+        fprintf(stderr,
+                "[RTV-ATTR-CREATE] resource_id=%u format=%d dims=%llux%ux%u(d) mips=%u dim=%d flags=0x%x heap_type=%d cookie=%u\n",
+                object->proton_resource_id,
+                (int)desc->Format,
+                (unsigned long long)desc->Width,
+                (unsigned)desc->Height,
+                (unsigned)desc->DepthOrArraySize,
+                (unsigned)desc->MipLevels,
+                (int)desc->Dimension,
+                (unsigned)desc->Flags,
+                (int)heap_type,
+                object->res.cookie.index);
+        fflush(stderr);
+    }
 
     *resource = object;
     return S_OK;

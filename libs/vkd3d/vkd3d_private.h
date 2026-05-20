@@ -1158,6 +1158,14 @@ struct d3d12_resource
 
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
+
+    /* [RTV-ATTR] Stable, monotonically-increasing resource ID assigned at
+     * d3d12_resource_create time. Used by the PROTON_VKD3D_RTV_ATTR
+     * instrumentation to give resources stable, human-friendly identifiers
+     * across log lines. 0 means "not tagged" (fallback for resources whose
+     * creation path bypasses d3d12_resource_create). End-of-struct placement
+     * keeps existing field offsets stable. */
+    uint32_t proton_resource_id;
 };
 
 static inline bool d3d12_resource_is_buffer(const struct d3d12_resource *resource)
@@ -1180,6 +1188,12 @@ static inline VkImageLayout d3d12_resource_pick_layout(const struct d3d12_resour
     return resource->flags & VKD3D_RESOURCE_GENERAL_LAYOUT ?
             VK_IMAGE_LAYOUT_GENERAL : layout;
 }
+
+/* [RTV-ATTR] PROTON_VKD3D_RTV_ATTR=1 env-gate; defined in resource.c. */
+bool proton_rtv_attr_enabled(void);
+
+/* [PSO-TRACE] PROTON_VKD3D_PSO_TRACE=1 env-gate; defined in resource.c. */
+bool proton_pso_trace_enabled(void);
 
 ULONG d3d12_resource_incref(struct d3d12_resource *resource);
 ULONG d3d12_resource_decref(struct d3d12_resource *resource);
@@ -3331,6 +3345,61 @@ struct d3d12_command_list
      * though in practice a command list is recorded by a single thread. */
     uint32_t draw_count_trace;
     uint32_t dispatch_count_trace;
+    uint32_t indirect_count_trace;
+    uint32_t bundle_count_trace;
+    uint32_t mesh_count_trace;
+    uint32_t barrier_count_trace;
+    uint32_t clear_count_trace;
+    uint32_t omrt_count_trace;
+    uint32_t setpso_count_trace;
+    uint32_t setrootsig_count_trace;
+    uint32_t setvb_count_trace;
+
+    /* [RTV-ATTR] PROTON_VKD3D_RTV_ATTR=1 per-cmdlist RTV attribution
+     * tracker. Each entry corresponds to a slot of the current
+     * OMSetRenderTargets binding; we maintain up to
+     * D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT (8) slots. When a draw fires
+     * we attribute the draw/vertex count to whichever slots currently hold
+     * a non-NULL resource. proton_rtv_attr_count is how many slots are
+     * presently bound (0 when no RTV is bound). */
+    struct
+    {
+        uint32_t resource_id;
+        uint32_t format;
+        uint32_t width;
+        uint32_t height;
+        uint32_t draws_since_bind;
+        uint64_t verts_since_bind;
+    } proton_rtv_attr[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    uint32_t proton_rtv_attr_count;
+    uint32_t proton_rtv_attr_total_binds;
+    uint32_t proton_rtv_attr_total_draws;
+    uint32_t proton_rtv_attr_total_dispatches;
+
+    /* [RTV-ATTR] Extended non-draw GPU-command counters used by the
+     * PROTON_VKD3D_RTV_ATTR summary. Cleared by reset_internal_state.
+     * End-of-struct placement preserves existing field offsets. */
+    uint32_t proton_rtv_attr_clear_rtv_count;
+    uint32_t proton_rtv_attr_clear_dsv_count;
+    uint32_t proton_rtv_attr_copy_resource_count;
+    uint32_t proton_rtv_attr_copy_texregion_count;
+    uint32_t proton_rtv_attr_copy_buffer_count;
+    uint32_t proton_rtv_attr_resolve_count;
+    uint32_t proton_rtv_attr_discard_count;
+
+    /* [RTV-ATTR] State-setup counters used by the PROTON_VKD3D_RTV_ATTR
+     * summary. Cleared by reset_internal_state. End-of-struct placement
+     * preserves existing field offsets. KCD2 menu-phase triage extension:
+     * does the title reach state-setup before bailing at draw issue? */
+    uint32_t proton_rtv_attr_setpso_count;
+    uint32_t proton_rtv_attr_setrootsig_count;
+    uint32_t proton_rtv_attr_setrootsig_compute_count;
+    uint32_t proton_rtv_attr_iasetvb_count;
+    uint32_t proton_rtv_attr_iasetib_count;
+    uint32_t proton_rtv_attr_iasetprim_count;
+    uint32_t proton_rtv_attr_rsvp_count;
+    uint32_t proton_rtv_attr_rssc_count;
+    uint32_t proton_rtv_attr_setrootdesctbl_count;
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     unsigned int breadcrumb_context_index;

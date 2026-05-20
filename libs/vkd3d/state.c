@@ -336,8 +336,19 @@ HRESULT vkd3d_create_pipeline_layout(struct d3d12_device *device,
 
     if (set_layout_count > device->vk_info.device_limits.maxBoundDescriptorSets)
     {
-        ERR("Root signature requires %u descriptor sets, but device only supports %u.\n",
-            set_layout_count, device->vk_info.device_limits.maxBoundDescriptorSets);
+        /* Throttle: this error is hot under titles whose root signatures exceed
+         * the device max descriptor sets (e.g. KCD2 on MoltenVK: 137k PSOs all
+         * fail = 137k ERR lines per launch, which has wedged WindowServer's
+         * compositor via Metal back-pressure during testing). Log the first
+         * occurrence + every 65,536th thereafter; suppression count makes the
+         * scope visible in the log. */
+        static LONG s_dsoverflow_log_count = 0;
+        LONG n = InterlockedIncrement(&s_dsoverflow_log_count);
+        if (n == 1 || (n & 0xFFFF) == 0)
+        {
+            ERR("Root signature requires %u descriptor sets, but device only supports %u. (occurrence #%ld)\n",
+                set_layout_count, device->vk_info.device_limits.maxBoundDescriptorSets, n);
+        }
         return E_INVALIDARG;
     }
 
@@ -5818,6 +5829,15 @@ static HRESULT d3d12_pipeline_create_private_root_signature(struct d3d12_device 
     return S_OK;
 }
 
+/* [PSO-TRACE] PROTON_VKD3D_PSO_TRACE=1 counters. Logged at INFO per PSO and
+ * summarised every 100. Reset to 0 once at first observation. */
+static uint32_t proton_pso_trace_graphics_attempts;
+static uint32_t proton_pso_trace_graphics_ok;
+static uint32_t proton_pso_trace_graphics_fail;
+static uint32_t proton_pso_trace_compute_attempts;
+static uint32_t proton_pso_trace_compute_ok;
+static uint32_t proton_pso_trace_compute_fail;
+
 HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindPoint bind_point,
         const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state)
 {
@@ -5825,10 +5845,37 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
     const struct d3d12_cached_pipeline_state *desc_cached_pso;
     struct d3d12_cached_pipeline_state cached_pso;
     struct d3d12_pipeline_state *object;
+    bool pso_trace;
     HRESULT hr;
 
+    pso_trace = proton_pso_trace_enabled();
+    if (pso_trace)
+    {
+        uint32_t attempts;
+        bool is_graphics = (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS);
+        const char *kind = is_graphics ? "GFX" : (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE ? "CMP" : "???");
+        bool has_cached_blob = (desc->cached_pso.blob.CachedBlobSizeInBytes != 0);
+        attempts = vkd3d_atomic_uint32_increment(
+                is_graphics ? &proton_pso_trace_graphics_attempts : &proton_pso_trace_compute_attempts,
+                vkd3d_memory_order_relaxed);
+        INFO("[PSO-TRACE] ENTER kind=%s attempt#%u cached_blob=%s\n",
+                kind, attempts, has_cached_blob ? "yes" : "no");
+    }
+
     if (!(object = vkd3d_malloc(sizeof(*object))))
+    {
+        if (pso_trace)
+        {
+            vkd3d_atomic_uint32_increment(
+                    bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS
+                            ? &proton_pso_trace_graphics_fail
+                            : &proton_pso_trace_compute_fail,
+                    vkd3d_memory_order_relaxed);
+            INFO("[PSO-TRACE] EXIT kind=%s hr=0x%x reason=malloc_failed\n",
+                    bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ? "GFX" : "CMP", E_OUTOFMEMORY);
+        }
         return E_OUTOFMEMORY;
+    }
 
     memset(object, 0, sizeof(*object));
 
@@ -5886,6 +5933,16 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
                 d3d12_root_signature_dec_ref(object->root_signature);
             rwlock_destroy(&object->lock);
             vkd3d_free(object);
+            if (pso_trace)
+            {
+                vkd3d_atomic_uint32_increment(
+                        bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS
+                                ? &proton_pso_trace_graphics_fail
+                                : &proton_pso_trace_compute_fail,
+                        vkd3d_memory_order_relaxed);
+                INFO("[PSO-TRACE] EXIT kind=%s hr=0x%x reason=cached_pso_validate_failed\n",
+                        bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ? "GFX" : "CMP", hr);
+            }
             return hr;
         }
     }
@@ -5971,6 +6028,16 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
         rwlock_destroy(&object->lock);
 
         vkd3d_free(object);
+        if (pso_trace)
+        {
+            uint32_t fails = vkd3d_atomic_uint32_increment(
+                    bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS
+                            ? &proton_pso_trace_graphics_fail
+                            : &proton_pso_trace_compute_fail,
+                    vkd3d_memory_order_relaxed);
+            INFO("[PSO-TRACE] EXIT kind=%s hr=0x%x reason=init_failed fails_total=%u\n",
+                    bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ? "GFX" : "CMP", hr, fails);
+        }
         return hr;
     }
 
@@ -6023,6 +6090,28 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
 #ifdef VKD3D_ENABLE_PROFILING
     vkd3d_timestamp_profiler_register_pipeline_state(device->timestamp_profiler, object);
 #endif
+
+    if (pso_trace)
+    {
+        uint32_t oks = vkd3d_atomic_uint32_increment(
+                bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS
+                        ? &proton_pso_trace_graphics_ok
+                        : &proton_pso_trace_compute_ok,
+                vkd3d_memory_order_relaxed);
+        INFO("[PSO-TRACE] EXIT kind=%s hr=0x0 reason=ok object=%p oks_total=%u\n",
+                bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ? "GFX" : "CMP", object, oks);
+        /* Roll-up summary every 100 successful PSOs of either kind. */
+        if ((oks % 100u) == 0)
+        {
+            INFO("[PSO-TRACE] SUMMARY gfx_attempts=%u gfx_ok=%u gfx_fail=%u cmp_attempts=%u cmp_ok=%u cmp_fail=%u\n",
+                    vkd3d_atomic_uint32_load_explicit(&proton_pso_trace_graphics_attempts, vkd3d_memory_order_relaxed),
+                    vkd3d_atomic_uint32_load_explicit(&proton_pso_trace_graphics_ok, vkd3d_memory_order_relaxed),
+                    vkd3d_atomic_uint32_load_explicit(&proton_pso_trace_graphics_fail, vkd3d_memory_order_relaxed),
+                    vkd3d_atomic_uint32_load_explicit(&proton_pso_trace_compute_attempts, vkd3d_memory_order_relaxed),
+                    vkd3d_atomic_uint32_load_explicit(&proton_pso_trace_compute_ok, vkd3d_memory_order_relaxed),
+                    vkd3d_atomic_uint32_load_explicit(&proton_pso_trace_compute_fail, vkd3d_memory_order_relaxed));
+        }
+    }
 
     *state = object;
     return S_OK;
