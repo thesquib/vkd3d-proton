@@ -2023,6 +2023,8 @@ struct d3d12_root_signature
 
     uint32_t sampler_descriptor_set;
     uint32_t root_descriptor_set;
+    /* UINT32_MAX when null-SRV-fallback set is not appended to this RS. */
+    uint32_t null_srv_fallback_set;
 
     uint64_t descriptor_table_mask;
 #ifdef VKD3D_ENABLE_BREADCRUMBS
@@ -2846,6 +2848,7 @@ enum vkd3d_pipeline_dirty_flag
     VKD3D_PIPELINE_DIRTY_DESCRIPTOR_TABLE_OFFSETS = 0x00000002u,
     VKD3D_PIPELINE_DIRTY_HOISTED_DESCRIPTORS      = 0x00000004u,
     VKD3D_PIPELINE_DIRTY_INLINE_REDZONE           = 0x00000008u,
+    VKD3D_PIPELINE_DIRTY_NULL_SRV_FALLBACK_SET    = 0x00000010u,
 };
 
 struct vkd3d_root_descriptor_info
@@ -5801,6 +5804,31 @@ static inline bool vkd3d_address_binding_tracker_active(struct vkd3d_address_bin
     return tracker->messenger != VK_NULL_HANDLE;
 }
 
+/* Device-level "null SRV fallback" — single zero-filled Texture3D plus a
+ * dedicated descriptor set, appended to every root signature's pipeline
+ * layout when VKD3D_CONFIG_FLAG_RELAXED_UNMAPPED_SRV is active. When the
+ * normal SRV remap fails in dxil_srv_remap (e.g. CryEngine HDRFinalScenePS
+ * Tex3D variants whose RS declares u6 but not t6), dxil-spirv emits a binding
+ * pointing here, sample reads return (0,0,0,0), the PSO compiles, and the
+ * draw lands in the backbuffer instead of black-screening. */
+struct vkd3d_null_srv_fallback
+{
+    VkImage vk_image;
+    VkDeviceMemory vk_memory;
+    VkImageView vk_image_view;
+    VkSampler vk_sampler;
+    VkDescriptorSetLayout vk_set_layout;
+    VkDescriptorPool vk_pool;
+    VkDescriptorSet vk_set;
+    uint32_t set_index;            /* slot index reported via shader_interface_info */
+    uint32_t image_binding_index;  /* binding[0] = SAMPLED_IMAGE (Tex3D zero) */
+    uint32_t sampler_binding_index;/* binding[1] = SAMPLER (default state) */
+    bool active;
+};
+
+HRESULT vkd3d_null_srv_fallback_init(struct vkd3d_null_srv_fallback *fb, struct d3d12_device *device);
+void vkd3d_null_srv_fallback_cleanup(struct vkd3d_null_srv_fallback *fb, struct d3d12_device *device);
+
 struct vkd3d_null_rtas_allocation
 {
     VkDeviceAddress va;
@@ -5916,6 +5944,7 @@ struct d3d12_device
     struct vkd3d_pipeline_library_disk_cache disk_cache;
     struct vkd3d_global_descriptor_buffer global_descriptor_buffer;
     struct vkd3d_address_binding_tracker address_binding_tracker;
+    struct vkd3d_null_srv_fallback null_srv_fallback;
     rwlock_t vertex_input_lock;
     struct hash_map vertex_input_pipelines;
     rwlock_t fragment_output_lock;
