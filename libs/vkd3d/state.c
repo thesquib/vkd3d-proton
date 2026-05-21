@@ -2484,6 +2484,12 @@ void d3d12_pipeline_state_dec_ref(struct d3d12_pipeline_state *state)
 
         if (state->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS || state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
             d3d12_pipeline_state_free_cached_desc(&state->graphics.cached_desc);
+        if (state->lazy)
+        {
+            pthread_mutex_destroy(&state->lazy->compile_mutex);
+            vkd3d_free(state->lazy);
+            state->lazy = NULL;
+        }
         rwlock_destroy(&state->lock);
         vkd3d_free(state);
     }
@@ -3111,6 +3117,25 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
         if (FAILED(hr = vkd3d_compile_shader_stage(state, device,
                 VK_SHADER_STAGE_COMPUTE_BIT, code, spirv_code, spirv_code_debug)))
             return hr;
+    }
+
+    /* VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE: defer everything from here. The DXIL
+     * has already been translated to SPIR-V (or loaded from cache) above, so
+     * the deferred-compile path can resume from this point cheaply. We do NOT
+     * create the VkShaderModule yet because that allocates driver memory we
+     * want to avoid in the "PSO created but never bound" case. */
+    if (state->lazy)
+    {
+        (void)vk_cache;
+        (void)feedbacks;
+        (void)feedback_info;
+        (void)feedback;
+        (void)cookie;
+        (void)spec_info;
+        (void)required_subgroup_size_info;
+        (void)spirv_code_debug;
+        TRACE("Deferred compute pipeline create (lazy_pso_compile).\n");
+        return S_OK;
     }
 
     if (FAILED(hr = vkd3d_setup_shader_stage(state, device,
@@ -5695,6 +5720,25 @@ static HRESULT d3d12_pipeline_state_init_static_pipeline(struct d3d12_pipeline_s
     graphics->library_flags = 0;
     graphics->library_create_flags = 0;
 
+    /* VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE: skip the eager variant creates. The
+     * dynamic-state flag computation that create_pipeline_variant performs as
+     * a side-effect (graphics->pipeline_dynamic_states) is also performed by
+     * d3d12_graphics_pipeline_state_init_dynamic_state called from the
+     * variant function itself, so we replicate that here so that bind-time
+     * code observing pipeline_dynamic_states still sees sensible values
+     * before the deferred compile runs. We do this by calling into the dynamic
+     * state init helper directly; it is side-effect free w.r.t. Vulkan. */
+    if (state->lazy)
+    {
+        VkPipelineDynamicStateCreateInfo dynamic_create_info;
+        VkDynamicState dynamic_state_buffer[ARRAY_SIZE(vkd3d_dynamic_state_list)];
+        graphics->pipeline_dynamic_states =
+                d3d12_graphics_pipeline_state_init_dynamic_state(state,
+                        &dynamic_create_info, dynamic_state_buffer, NULL);
+        graphics->dsv_plane_optimal_mask = d3d12_graphics_pipeline_state_get_plane_optimal_mask(graphics);
+        return S_OK;
+    }
+
     if (create_library && has_gpl)
     {
         if (!(graphics->library = d3d12_pipeline_state_create_pipeline_variant(state, NULL, graphics->dsv_format,
@@ -6014,6 +6058,38 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
     object->refcount = 1;
     object->internal_refcount = 1;
 
+    /* VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE: allocate per-PSO deferred-compile
+     * bookkeeping BEFORE any of the init-* helpers run. The eager paths
+     * inspect state->lazy to decide whether to skip the vkCreate*Pipelines
+     * call. Disable lazy mode if the application supplied a cached blob: we
+     * want to honour the precompiled state in that case (no benefit to
+     * deferring, and the existing pso_is_loaded_from_cached_blob path
+     * disables SPIR-V retention). */
+    if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE) &&
+            desc_cached_pso->blob.CachedBlobSizeInBytes == 0)
+    {
+        object->lazy = vkd3d_calloc(1, sizeof(*object->lazy));
+        if (!object->lazy)
+        {
+            if (object->root_signature)
+                d3d12_root_signature_dec_ref(object->root_signature);
+            rwlock_destroy(&object->lock);
+            vkd3d_free(object);
+            return E_OUTOFMEMORY;
+        }
+        if (pthread_mutex_init(&object->lazy->compile_mutex, NULL) != 0)
+        {
+            vkd3d_free(object->lazy);
+            object->lazy = NULL;
+            if (object->root_signature)
+                d3d12_root_signature_dec_ref(object->root_signature);
+            rwlock_destroy(&object->lock);
+            vkd3d_free(object);
+            return E_FAIL;
+        }
+        object->lazy->status = VKD3D_LAZY_UNCOMPILED;
+    }
+
     hr = S_OK;
 
     if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_GLOBAL_PIPELINE_CACHE))
@@ -6092,17 +6168,25 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
      * For graphics pipelines, we have to keep VkShaderModules around in case we need fallback pipelines.
      * If we keep the SPIR-V around in memory, we can always create shader modules on-demand in case we
      * need to actually create fallback pipelines. This avoids unnecessary memory bloat. */
-    if (desc_cached_pso->blob.CachedBlobSizeInBytes ||
-            (device->disk_cache.library && (device->disk_cache.library->flags & VKD3D_PIPELINE_LIBRARY_FLAG_SHADER_IDENTIFIER)) ||
-            (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_NO_SERIALIZE_SPIRV))
-        d3d12_pipeline_state_free_spirv_code(object);
-    else
-        d3d12_pipeline_state_destroy_shader_modules(object, device);
+    /* VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE: keep both SPIR-V code AND VkShaderModules
+     * alive until the deferred compile actually runs. The eager init paths skipped
+     * vkCreate*Pipelines and never touched the modules; the late path in
+     * d3d12_pipeline_state_ensure_compiled needs them intact. We'll free them in
+     * d3d12_pipeline_state_compile_deferred after the create succeeds. */
+    if (!object->lazy)
+    {
+        if (desc_cached_pso->blob.CachedBlobSizeInBytes ||
+                (device->disk_cache.library && (device->disk_cache.library->flags & VKD3D_PIPELINE_LIBRARY_FLAG_SHADER_IDENTIFIER)) ||
+                (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_NO_SERIALIZE_SPIRV))
+            d3d12_pipeline_state_free_spirv_code(object);
+        else
+            d3d12_pipeline_state_destroy_shader_modules(object, device);
 
-    /* If it is impossible for us to recompile this shader, we can free VkShaderModules. Saves a lot of memory.
-     * If we are required to be able to serialize the SPIR-V, it will live as host pointers, not VkShaderModule. */
-    if (object->pso_is_fully_dynamic)
-        d3d12_pipeline_state_destroy_shader_modules(object, device);
+        /* If it is impossible for us to recompile this shader, we can free VkShaderModules. Saves a lot of memory.
+         * If we are required to be able to serialize the SPIR-V, it will live as host pointers, not VkShaderModule. */
+        if (object->pso_is_fully_dynamic)
+            d3d12_pipeline_state_destroy_shader_modules(object, device);
+    }
 
     /* We don't expect to serialize the PSO blob if we loaded it from cache.
      * Free the cache now to save on memory. */
@@ -6115,11 +6199,17 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
          * We are at risk of compiling code on the fly in some upcoming situations. */
         object->pso_is_loaded_from_cached_blob = true;
     }
-    else if (device->disk_cache.library)
+    else if (device->disk_cache.library && !object->lazy)
     {
         /* We compiled this PSO without any cache (internal or app-provided),
          * so we should serialize this to internal disk cache.
          * Pushes work to disk$ thread. */
+        /* VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE: skip the proactive disk-cache
+         * store path because it would force ensure_compiled (via the
+         * serialize-thread eventually calling vkd3d_serialize_pipeline_state)
+         * on every PSO, defeating the deferral. Application can still pick up
+         * cached blobs via the regular ID3D12PipelineLibrary path, which will
+         * compile on demand. */
         vkd3d_pipeline_library_store_pipeline_to_disk_cache(&device->disk_cache, object);
     }
 
@@ -6781,6 +6871,151 @@ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_sta
     if (!vk_pipeline)
         ERR("Could not get the pipeline compiled by other thread from the cache.\n");
     return vk_pipeline;
+}
+
+/* VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE: perform the work the eager init paths
+ * skipped — call vkCreate{Graphics,Compute}Pipelines now. Must be called with
+ * state->lazy->compile_mutex held. */
+static HRESULT d3d12_pipeline_state_compile_deferred(struct d3d12_pipeline_state *state)
+{
+    struct d3d12_device *device = state->device;
+    HRESULT hr = S_OK;
+
+    if (d3d12_pipeline_state_is_compute(state))
+    {
+        D3D12_SHADER_BYTECODE dummy_cs;
+
+        /* compute.code already contains SPIR-V from the eager init step; the
+         * fallback compile path inside vkd3d_create_compute_pipeline only re-
+         * reads `code` when spirv_code->code is NULL, which is not our case
+         * here. Pass a zero-init D3D12_SHADER_BYTECODE to satisfy the
+         * signature. */
+        memset(&dummy_cs, 0, sizeof(dummy_cs));
+        hr = vkd3d_create_compute_pipeline(state, device, &dummy_cs);
+        if (FAILED(hr))
+        {
+            ERR("Deferred compute pipeline create failed, hr %#x.\n", hr);
+            return hr;
+        }
+    }
+    else if (d3d12_pipeline_state_is_graphics(state))
+    {
+        struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
+        bool can_compile_pipeline_early, has_gpl, create_library = false;
+        VkGraphicsPipelineLibraryFlagsEXT library_flags = 0;
+        bool has_tess;
+
+        /* Replay the gating logic from d3d12_pipeline_state_init_static_pipeline
+         * using fields that are persisted on the PSO. desc->primitive_topology_type
+         * is recovered from graphics->primitive_topology_type. */
+        has_gpl = device->device_info.graphics_pipeline_library_features.graphicsPipelineLibrary &&
+                !graphics->multiview.dynamic_mask;
+
+        library_flags = VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT |
+                VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
+                VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT |
+                VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
+
+        if (d3d12_graphics_pipeline_state_has_unknown_dsv_format_with_test(graphics))
+        {
+            library_flags &= ~VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
+            create_library = true;
+        }
+
+        if (graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT)
+        {
+            can_compile_pipeline_early = true;
+            library_flags &= ~VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT;
+        }
+        else
+        {
+            has_tess = !!(graphics->stage_flags & VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT);
+            can_compile_pipeline_early = !has_tess || graphics->patch_vertex_count != 0 ||
+                    device->device_info.extended_dynamic_state2_features.extendedDynamicState2PatchControlPoints;
+
+            if (graphics->primitive_topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED)
+            {
+                library_flags &= ~VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT;
+                create_library = true;
+                can_compile_pipeline_early = false;
+            }
+
+            if (has_tess && !device->device_info.extended_dynamic_state2_features.extendedDynamicState2PatchControlPoints)
+                create_library = false;
+        }
+
+        /* Temporarily mask state->lazy so create_pipeline_variant runs its
+         * vkCreateGraphicsPipelines call this time. We can't simply clear it
+         * because the lazy bookkeeping is checked elsewhere. The eager-init
+         * site uses state->lazy != NULL to skip work; we have no equivalent
+         * skip inside create_pipeline_variant itself, so this is purely
+         * defensive (no current call-site reads it within that function). */
+        if (create_library && has_gpl && graphics->library == VK_NULL_HANDLE)
+        {
+            if (!(graphics->library = d3d12_pipeline_state_create_pipeline_variant(state, NULL, graphics->dsv_format,
+                    state->vk_pso_cache, library_flags, &graphics->pipeline_dynamic_states)))
+                return E_OUTOFMEMORY;
+        }
+
+        if (can_compile_pipeline_early && graphics->pipeline == VK_NULL_HANDLE)
+        {
+            if (!(graphics->pipeline = d3d12_pipeline_state_create_pipeline_variant(state, NULL, graphics->dsv_format,
+                    state->vk_pso_cache, 0, &graphics->pipeline_dynamic_states)))
+                return E_OUTOFMEMORY;
+        }
+
+        /* Re-evaluate pso_is_fully_dynamic now that graphics->pipeline exists.
+         * Mirrors the calculation in d3d12_pipeline_state_finish_graphics. */
+        state->pso_is_fully_dynamic =
+                graphics->pipeline &&
+                !d3d12_graphics_pipeline_state_has_unknown_dsv_format_with_test(graphics);
+
+        if (graphics->primitive_topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH &&
+                !(graphics->pipeline_dynamic_states & VKD3D_DYNAMIC_STATE_PATCH_CONTROL_POINTS))
+            state->pso_is_fully_dynamic = false;
+
+        if (d3d12_graphics_pipeline_needs_dynamic_rasterization_samples(graphics) &&
+                !(graphics->pipeline_dynamic_states & VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES))
+            state->pso_is_fully_dynamic = false;
+
+        if (graphics->multiview.dynamic_mask)
+            state->pso_is_fully_dynamic = false;
+    }
+    else
+    {
+        /* Other pipeline types should not get state->lazy attached. */
+        WARN("Deferred compile requested on non-graphics/non-compute PSO; ignoring.\n");
+    }
+
+    return hr;
+}
+
+bool d3d12_pipeline_state_ensure_compiled(struct d3d12_pipeline_state *state)
+{
+    uint32_t s;
+
+    if (!state || !state->lazy)
+        return true;
+
+    s = vkd3d_atomic_uint32_load_explicit(&state->lazy->status, vkd3d_memory_order_acquire);
+    if (s == VKD3D_LAZY_COMPILED)
+        return true;
+    if (s == VKD3D_LAZY_FAILED)
+        return false;
+
+    pthread_mutex_lock(&state->lazy->compile_mutex);
+    s = vkd3d_atomic_uint32_load_explicit(&state->lazy->status, vkd3d_memory_order_relaxed);
+    if (s == VKD3D_LAZY_UNCOMPILED)
+    {
+        HRESULT hr;
+        vkd3d_atomic_uint32_store_explicit(&state->lazy->status, VKD3D_LAZY_COMPILING, vkd3d_memory_order_relaxed);
+        hr = d3d12_pipeline_state_compile_deferred(state);
+        s = SUCCEEDED(hr) ? VKD3D_LAZY_COMPILED : VKD3D_LAZY_FAILED;
+        vkd3d_atomic_uint32_store_explicit(&state->lazy->status, s, vkd3d_memory_order_release);
+    }
+    pthread_mutex_unlock(&state->lazy->compile_mutex);
+
+    return s == VKD3D_LAZY_COMPILED;
 }
 
 static uint32_t d3d12_max_descriptor_count_from_heap_type(struct d3d12_device *device, D3D12_DESCRIPTOR_HEAP_TYPE heap_type)

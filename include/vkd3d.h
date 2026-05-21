@@ -120,6 +120,12 @@ extern "C" {
 #define VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION (1ull << 60)
 #define VKD3D_CONFIG_FLAG_PREFER_THIN_UAV_TILING (1ull << 61)
 #define VKD3D_CONFIG_FLAG_EXTENDED_DEBUG_UTILS (1ull << 62)
+/* When set, vkCreate{Graphics,Compute}Pipelines is deferred until the first
+ * draw/dispatch bind that needs the PSO. PSOs that the application creates
+ * but never binds are never compiled, which cuts the IOAccelerator dirty-
+ * memory burst on Apple Silicon (KCD2 ~8MB-per-PSO × 137k = ~1TB projection
+ * if eagerly compiled). Gated on draw-prep, not SetPipelineState. */
+#define VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE (1ull << 63)
 
 struct vkd3d_instance;
 

@@ -2275,6 +2275,27 @@ struct vkd3d_pipeline_cache_compatibility
 };
 
 /* ID3D12PipelineState */
+/* VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE: per-PSO state used to defer
+ * vkCreate{Graphics,Compute}Pipelines until first bind from a draw/dispatch
+ * prep path. NULL when the flag is unset, so the eager path is unchanged. */
+enum vkd3d_pso_lazy_status
+{
+    VKD3D_LAZY_UNCOMPILED = 0,
+    VKD3D_LAZY_COMPILING  = 1,
+    VKD3D_LAZY_COMPILED   = 2,
+    VKD3D_LAZY_FAILED     = 3,
+};
+
+struct vkd3d_pipeline_lazy_compile_data
+{
+    /* Bookkeeping; the eager-init code already deep-copies the bytecode we
+     * need (cached_desc.bytecode for graphics, via bytecode_duped_mask). The
+     * compute SPIR-V we compile from is already retained in state->compute.code
+     * by the eager DXIL->SPIR-V step, which we leave intact in lazy mode. */
+    uint32_t status;  /* enum vkd3d_pso_lazy_status, accessed via vkd3d_atomic_uint32 */
+    pthread_mutex_t compile_mutex;
+};
+
 struct d3d12_pipeline_state
 {
     ID3D12PipelineState ID3D12PipelineState_iface;
@@ -2297,6 +2318,10 @@ struct d3d12_pipeline_state
     bool root_signature_compat_hash_is_dxbc_derived;
     bool pso_is_loaded_from_cached_blob;
     bool pso_is_fully_dynamic;
+
+    /* Non-NULL only when VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE is set; controls
+     * the deferred vkCreate*Pipelines machinery in state.c / command.c. */
+    struct vkd3d_pipeline_lazy_compile_data *lazy;
 
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
@@ -2415,6 +2440,13 @@ VkPipeline d3d12_pipeline_state_get_pipeline(struct d3d12_pipeline_state *state,
 VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_state *state,
         const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format,
         VkPipelineCache vk_cache, VkGraphicsPipelineLibraryFlagsEXT library_flags, uint32_t *dynamic_state_flags);
+
+/* VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE: ensure the deferred eager-create work
+ * (vkCreate{Graphics,Compute}Pipelines) has actually been done. Idempotent,
+ * thread-safe, and a no-op when state->lazy is NULL. Returns false if the
+ * deferred compile has failed, in which case the caller (draw/dispatch prep)
+ * must skip the draw. */
+bool d3d12_pipeline_state_ensure_compiled(struct d3d12_pipeline_state *state);
 
 static inline struct d3d12_pipeline_state *impl_from_ID3D12PipelineState(ID3D12PipelineState *iface)
 {
