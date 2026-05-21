@@ -1138,6 +1138,15 @@ VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_
         const struct d3d12_pipeline_state *state, size_t *size, void *data)
 {
     const VkPhysicalDeviceProperties *device_properties = &state->device->device_info.properties2.properties;
+
+    /* VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE: the serialize path reads cooked
+     * pipeline state (vk_pso_cache contents, compute.vk_pipeline,
+     * graphics.identifiers[]) that only exists after the deferred compile has
+     * run. Force it here so the serialized blob is not silently empty. The
+     * cast away const is safe — ensure_compiled mutates the cooked state but
+     * not the immutable input desc. */
+    if (state->lazy)
+        d3d12_pipeline_state_ensure_compiled((struct d3d12_pipeline_state *)state);
     const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
     struct vkd3d_pipeline_blob_chunk_pso_compat *pso_compat;
     size_t varint_size[VKD3D_MAX_SHADER_STAGES];
