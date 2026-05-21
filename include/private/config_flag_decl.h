@@ -75,3 +75,4 @@ VKD3D_DECL_CONFIG("fail_unsupported_state_template", FAIL_UNSUPPORTED_STATE_TEMP
 VKD3D_DECL_CONFIG("ignore_shared_fence", IGNORE_SHARED_FENCE)
 VKD3D_DECL_CONFIG("adreno_7xx_extra_compat", ADRENO_7XX_EXTRA_COMPAT)
 VKD3D_DECL_CONFIG("relaxed_unmapped_srv", RELAXED_UNMAPPED_SRV)
+VKD3D_DECL_CONFIG("lazy_pso_compile", LAZY_PSO_COMPILE)
