@@ -7589,6 +7589,11 @@ static bool d3d12_command_list_update_compute_pipeline(struct d3d12_command_list
         return false;
     }
 
+    /* VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE: defer the eager vkCreateComputePipelines
+     * until this dispatch-prep moment. No-op when state->lazy is NULL. */
+    if (list->state->lazy && !d3d12_pipeline_state_ensure_compiled(list->state))
+        return false;
+
     if (list->command_buffer_pipeline != list->state->compute.vk_pipeline)
     {
         VK_CALL(vkCmdBindPipeline(list->cmd.vk_command_buffer,
@@ -7759,6 +7764,14 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
         WARN("Attempting to draw with PATCH list on a non-tessellated PSO, skipping.\n");
         return false;
     }
+
+    /* VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE: run the deferred vkCreate*Pipelines
+     * now, before any read of graphics->pipeline / graphics->library by the
+     * get_pipeline helpers. No-op when state->lazy is NULL. Returning false
+     * here causes the draw to be skipped, which is the correct fail-closed
+     * behaviour if compilation actually failed. */
+    if (list->state->lazy && !d3d12_pipeline_state_ensure_compiled(list->state))
+        return false;
 
     /* Try to grab the pipeline we compiled ahead of time. If we cannot do so, fall back. */
     if (!(vk_pipeline = d3d12_pipeline_state_get_pipeline(list->state,
