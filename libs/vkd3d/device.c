@@ -1296,6 +1296,7 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
     {"prefer_thin_uav_tiling", VKD3D_CONFIG_FLAG_PREFER_THIN_UAV_TILING},
     {"no_nvx", VKD3D_CONFIG_FLAG_NO_NVX},
     {"relaxed_unmapped_srv", VKD3D_CONFIG_FLAG_RELAXED_UNMAPPED_SRV},
+    {"lazy_pso_compile", VKD3D_CONFIG_FLAG_LAZY_PSO_COMPILE},
 };
 
 static void vkd3d_config_flags_init_once(void)
@@ -11409,15 +11410,20 @@ HRESULT vkd3d_null_srv_fallback_init(struct vkd3d_null_srv_fallback *fb,
 
     memset(fb, 0, sizeof(*fb));
 
-    /* 1x1x1 R8G8B8A8_UNORM Texture3D. */
+    /* 32x32x32 R8G8B8A8_UNORM Texture3D with full mip chain (6 levels).
+     * Matches typical color-grading LUT dimensions so CryEngine HDR
+     * tonemap samplers don't trip Metal validation (kIOGPUCommandBufferCallbackErrorInvalidResource
+     * code 9 was triggered by 1x1x1 with no mips — implicit-LOD samples
+     * couldn't resolve). All mips cleared to (1,1,1,1) for neutral multiply
+     * passthrough of the scene color. */
     memset(&image_info, 0, sizeof(image_info));
     image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     image_info.imageType = VK_IMAGE_TYPE_3D;
     image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
-    image_info.extent.width = 1;
-    image_info.extent.height = 1;
-    image_info.extent.depth = 1;
-    image_info.mipLevels = 1;
+    image_info.extent.width = 32;
+    image_info.extent.height = 32;
+    image_info.extent.depth = 32;
+    image_info.mipLevels = 6;  /* floor(log2(32)) + 1 */
     image_info.arrayLayers = 1;
     image_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -11464,7 +11470,7 @@ HRESULT vkd3d_null_srv_fallback_init(struct vkd3d_null_srv_fallback *fb,
     view_info.viewType = VK_IMAGE_VIEW_TYPE_3D;
     view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
     view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.levelCount = 6;
     view_info.subresourceRange.layerCount = 1;
     if ((vr = VK_CALL(vkCreateImageView(device->vk_device, &view_info, NULL, &fb->vk_image_view))) != VK_SUCCESS)
         goto fail;
@@ -11546,7 +11552,7 @@ HRESULT vkd3d_null_srv_fallback_init(struct vkd3d_null_srv_fallback *fb,
 
     memset(&full_range, 0, sizeof(full_range));
     full_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    full_range.levelCount = 1;
+    full_range.levelCount = 6;  /* clear all 6 mips at once */
     full_range.layerCount = 1;
 
     /* UNDEFINED -> TRANSFER_DST_OPTIMAL */
@@ -11568,7 +11574,16 @@ HRESULT vkd3d_null_srv_fallback_init(struct vkd3d_null_srv_fallback *fb,
     dep_info.pImageMemoryBarriers = &barrier;
     VK_CALL(vkCmdPipelineBarrier2(tmp_cb, &dep_info));
 
+    /* Fill the sentinel with white (1,1,1,1) instead of zero. CryEngine's
+     * HDRFinalScenePS samples the color-grading 3D LUT and applies it
+     * MULTIPLICATIVELY to the tonemapped scene. With (0,0,0,0) the output
+     * is uniformly black; with (1,1,1,1) the LUT contributes neutrally,
+     * so the scene shows through with no color grading applied. */
     memset(&clear_color, 0, sizeof(clear_color));
+    clear_color.float32[0] = 1.0f;
+    clear_color.float32[1] = 1.0f;
+    clear_color.float32[2] = 1.0f;
+    clear_color.float32[3] = 1.0f;
     VK_CALL(vkCmdClearColorImage(tmp_cb, fb->vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             &clear_color, 1, &full_range));
 
@@ -11632,7 +11647,7 @@ HRESULT vkd3d_null_srv_fallback_init(struct vkd3d_null_srv_fallback *fb,
     fb->sampler_binding_index = 1;
     fb->active = true;
 
-    INFO("[NULL-SRV-FALLBACK] initialized (Texture3D zero sentinel + default sampler).\n");
+    INFO("[NULL-SRV-FALLBACK] initialized (Texture3D white sentinel + default sampler).\n");
     hr = S_OK;
 
 done:
