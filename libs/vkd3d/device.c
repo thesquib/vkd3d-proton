@@ -10841,16 +10841,20 @@ static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
                         device->device_info.vulkan_1_2_properties.shaderDenormPreserveFloat32;
             }
         }
-        /* MoltenVK reports denormBehaviorIndependence=NONE because Metal has no
-         * vocabulary for D3D12-style per-stage denorm controls. In practice Apple
-         * Silicon's shader compiler handles denorms acceptably for the workloads
-         * that motivate SM 6.2+ — most D3D12 titles use 6.2+ bytecode and treat
-         * the cap response as a yes/no "can I use these shaders" gate. Without
-         * this override we clamp every Apple-Silicon device to SM 6.0; titles
-         * shipping precompiled SM 6.2 bytecode (KCD2 / CryEngine 5.5) then have
-         * every shader filtered out by their renderer, produce empty render-
-         * item lists, and ship a black screen. */
-        if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK)
+        /* MoltenVK and KosmicKrisp both report denormBehaviorIndependence=NONE
+         * because Metal has no vocabulary for D3D12-style per-stage denorm
+         * controls. In practice Apple Silicon's shader compiler handles denorms
+         * acceptably for the workloads that motivate SM 6.2+ — most D3D12 titles
+         * use 6.2+ bytecode and treat the cap response as a yes/no "can I use
+         * these shaders" gate. Without this override we clamp every Apple-Silicon
+         * device to SM 6.0; titles shipping precompiled SM 6.2 bytecode (KCD2 /
+         * CryEngine 5.5) then have every shader filtered out by their renderer,
+         * produce empty render-item lists, and ship a black screen. The override
+         * must cover KosmicKrisp too — it is the same Metal backend, just a
+         * different driverID, so the MoltenVK-only gate left KK clamped to SM
+         * 6.0 (KCD2 black on KK while it rendered on MVK). */
+        if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MOLTENVK ||
+            device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_KOSMICKRISP)
             denorm_behavior = true;
 
         if (denorm_behavior)
