@@ -3878,6 +3878,8 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
 
+    proton_vkd3d_rt_scan_unregister(resource); /* [RT-SCAN] drop from registry before teardown */
+
     if (resource->flags & VKD3D_RESOURCE_RESERVED)
         d3d12_resource_wait_for_sparse_init(resource);
 
@@ -4187,6 +4189,7 @@ static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags
     }
 
     *resource = object;
+    proton_vkd3d_rt_scan_register(object); /* [RT-SCAN] diagnostic; no-op unless PROTON_VKD3D_RT_SCAN=1 */
     return S_OK;
 }
 
