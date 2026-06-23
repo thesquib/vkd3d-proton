@@ -2302,6 +2302,276 @@ static bool proton_bb_sample_init(struct dxgi_vk_swap_chain *chain)
     return true;
 }
 
+/* [RT-SCAN] PROTON_VKD3D_RT_SCAN=1: register large COLOR render targets at
+ * resource-create; at present, sample each into a host buffer to detect whether
+ * KK rendered the scene to ANY RT even when the final backbuffer is black.
+ * Splits "final-composite black" from "global geometry/state failure". Holds no
+ * refs; unregisters on resource destroy under a lock. Diagnostic — persistent
+ * large RTs (scene/HDR) are stable so the present-time sample is low-risk. */
+#define PROTON_RT_SCAN_MAX 32
+#define PROTON_RT_SAMPLE_W 32
+#define PROTON_RT_SAMPLE_H 32
+#define PROTON_RT_SLOT_BYTES (PROTON_RT_SAMPLE_W * PROTON_RT_SAMPLE_H * 8) /* up to 8 bytes/texel */
+#define PROTON_RT_BUF_BYTES (PROTON_RT_SLOT_BYTES * PROTON_RT_SCAN_MAX)
+
+static pthread_mutex_t s_rt_scan_lock = PTHREAD_MUTEX_INITIALIZER;
+static int s_rt_scan_enabled = -1;
+static struct proton_rt_entry {
+    struct d3d12_resource *res;
+    VkImage image;
+    uint32_t w, h;
+    int vk_format;
+} s_rt_entries[PROTON_RT_SCAN_MAX];
+static int s_rt_count;
+static struct proton_rt_scan_state {
+    int inited;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    void *mapped;
+    uint32_t pending_seq;
+    int pending_n;
+    struct { uint32_t w, h; int fmt; int layout; int is_bb; } pending[PROTON_RT_SCAN_MAX];
+} s_rt_scan;
+
+static int proton_rt_scan_on(void)
+{
+    if (s_rt_scan_enabled < 0)
+    {
+        const char *v = getenv("PROTON_VKD3D_RT_SCAN");
+        s_rt_scan_enabled = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return s_rt_scan_enabled;
+}
+
+void proton_vkd3d_rt_scan_register(struct d3d12_resource *res)
+{
+    int i, smallest;
+    uint64_t smallest_area, area;
+    if (!proton_rt_scan_on() || !res) return;
+    /* [RT-SCAN] DIAG: log every large 2D texture create so we can see what KCD2
+     * makes and why the RT filter misses the scene buffer. */
+    if (!d3d12_resource_is_buffer(res) &&
+        res->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        res->desc.Width >= 512)
+    {
+        INFO("[RT-SCAN] CREATE 2Dtex %llux%u flags=0x%x vkfmt=%d vkimg=%d\n",
+             (unsigned long long)res->desc.Width, (unsigned)res->desc.Height,
+             (unsigned)res->desc.Flags,
+             res->format ? (int)res->format->vk_format : -1,
+             res->res.vk_image != VK_NULL_HANDLE);
+    }
+    if (d3d12_resource_is_buffer(res)) return;
+    if (res->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
+    if (!(res->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) return;
+    if (res->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) return;
+    if (res->desc.Width < 640 || res->desc.Height < 360) return;
+    /* NOTE: res->res.vk_image is NULL here (bound later); read it lazily at sample time. */
+    area = (uint64_t)res->desc.Width * res->desc.Height;
+    pthread_mutex_lock(&s_rt_scan_lock);
+    for (i = 0; i < s_rt_count; ++i)
+        if (s_rt_entries[i].res == res) { pthread_mutex_unlock(&s_rt_scan_lock); return; }
+    if (s_rt_count < PROTON_RT_SCAN_MAX)
+        i = s_rt_count++;
+    else
+    {
+        smallest = -1; smallest_area = ~0ull;
+        for (i = 0; i < PROTON_RT_SCAN_MAX; ++i)
+        {
+            uint64_t a = (uint64_t)s_rt_entries[i].w * s_rt_entries[i].h;
+            if (a < smallest_area) { smallest_area = a; smallest = i; }
+        }
+        if (smallest < 0 || smallest_area >= area) { pthread_mutex_unlock(&s_rt_scan_lock); return; }
+        i = smallest;
+    }
+    s_rt_entries[i].res = res;
+    s_rt_entries[i].image = res->res.vk_image;
+    s_rt_entries[i].w = (uint32_t)res->desc.Width;
+    s_rt_entries[i].h = res->desc.Height;
+    s_rt_entries[i].vk_format = res->format ? (int)res->format->vk_format : -1;
+    INFO("[RT-SCAN] register slot=%d %ux%u fmt=%d count=%d\n",
+         i, s_rt_entries[i].w, s_rt_entries[i].h, s_rt_entries[i].vk_format, s_rt_count);
+    pthread_mutex_unlock(&s_rt_scan_lock);
+}
+
+void proton_vkd3d_rt_scan_unregister(struct d3d12_resource *res)
+{
+    int i;
+    if (s_rt_scan_enabled <= 0) return;
+    pthread_mutex_lock(&s_rt_scan_lock);
+    for (i = 0; i < s_rt_count; ++i)
+        if (s_rt_entries[i].res == res) { s_rt_entries[i] = s_rt_entries[--s_rt_count]; break; }
+    pthread_mutex_unlock(&s_rt_scan_lock);
+}
+
+static bool proton_rt_scan_init(struct dxgi_vk_swap_chain *chain)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+    VkDevice vk_device = chain->queue->device->vk_device;
+    const VkPhysicalDeviceMemoryProperties *mp = &chain->queue->device->memory_properties;
+    VkMemoryAllocateInfo alloc_info;
+    VkMemoryRequirements mreq;
+    VkBufferCreateInfo bci;
+    VkBindBufferMemoryInfo bind_info;
+    uint32_t i, chosen;
+    VkResult vr;
+
+    if (s_rt_scan.inited) return true;
+
+    memset(&bci, 0, sizeof(bci));
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = PROTON_RT_BUF_BYTES;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    vr = VK_CALL(vkCreateBuffer(vk_device, &bci, NULL, &s_rt_scan.buffer));
+    if (vr < 0) { ERR("[RT-SCAN] vkCreateBuffer vr=%d\n", vr); return false; }
+    VK_CALL(vkGetBufferMemoryRequirements(vk_device, s_rt_scan.buffer, &mreq));
+    chosen = UINT32_MAX;
+    for (i = 0; i < mp->memoryTypeCount; ++i)
+    {
+        if (!((mreq.memoryTypeBits >> i) & 1u)) continue;
+        if ((mp->memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        { chosen = i; break; }
+    }
+    if (chosen == UINT32_MAX) { ERR("[RT-SCAN] no host-visible mem\n"); VK_CALL(vkDestroyBuffer(vk_device, s_rt_scan.buffer, NULL)); s_rt_scan.buffer = VK_NULL_HANDLE; return false; }
+    memset(&alloc_info, 0, sizeof(alloc_info));
+    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.allocationSize = mreq.size;
+    alloc_info.memoryTypeIndex = chosen;
+    vr = VK_CALL(vkAllocateMemory(vk_device, &alloc_info, NULL, &s_rt_scan.memory));
+    if (vr < 0) { ERR("[RT-SCAN] vkAllocateMemory vr=%d\n", vr); VK_CALL(vkDestroyBuffer(vk_device, s_rt_scan.buffer, NULL)); s_rt_scan.buffer = VK_NULL_HANDLE; return false; }
+    memset(&bind_info, 0, sizeof(bind_info));
+    bind_info.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
+    bind_info.buffer = s_rt_scan.buffer;
+    bind_info.memory = s_rt_scan.memory;
+    bind_info.memoryOffset = 0;
+    vr = VK_CALL(vkBindBufferMemory2(vk_device, 1, &bind_info));
+    if (vr < 0) { ERR("[RT-SCAN] bind vr=%d\n", vr); return false; }
+    vr = VK_CALL(vkMapMemory(vk_device, s_rt_scan.memory, 0, mreq.size, 0, &s_rt_scan.mapped));
+    if (vr < 0) { ERR("[RT-SCAN] map vr=%d\n", vr); return false; }
+    s_rt_scan.inited = 1;
+    INFO("[RT-SCAN] init OK buf bytes=%u slots=%d\n", (unsigned)PROTON_RT_BUF_BYTES, PROTON_RT_SCAN_MAX);
+    return true;
+}
+
+/* Record (into the present command buffer) a center-32x32 copy of each
+ * registered RT. Returns the number of RTs queued (also stamps s_rt_scan.pending). */
+static void proton_rt_scan_record(struct dxgi_vk_swap_chain *chain, VkCommandBuffer vk_cmd, uint32_t seq)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+    int i, n = 0;
+    if (!proton_rt_scan_on() || !proton_rt_scan_init(chain)) return;
+    memset(s_rt_scan.mapped, 0, PROTON_RT_BUF_BYTES);
+    pthread_mutex_lock(&s_rt_scan_lock);
+    for (i = 0; i < s_rt_count && n < PROTON_RT_SCAN_MAX; ++i)
+    {
+        VkImageMemoryBarrier2 b[1];
+        VkDependencyInfo dep;
+        VkCopyImageToBufferInfo2 copy_info;
+        VkBufferImageCopy2 region;
+        struct d3d12_resource *res = s_rt_entries[i].res;   /* alive: destroy unregisters under this lock */
+        VkImage img = res->res.vk_image;
+        VkImageLayout common = res->common_layout;
+        if (img == VK_NULL_HANDLE) continue;                /* not yet bound / never used */
+        uint32_t w = s_rt_entries[i].w, h = s_rt_entries[i].h;
+        int32_t ox = (w > PROTON_RT_SAMPLE_W) ? (int32_t)((w - PROTON_RT_SAMPLE_W) / 2) : 0;
+        int32_t oy = (h > PROTON_RT_SAMPLE_H) ? (int32_t)((h - PROTON_RT_SAMPLE_H) / 2) : 0;
+
+        /* common_layout -> TRANSFER_SRC for the copy */
+        memset(b, 0, sizeof(b));
+        b[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        b[0].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b[0].srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        b[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        b[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        b[0].oldLayout = common;
+        b[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b[0].image = img;
+        b[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b[0].subresourceRange.levelCount = 1;
+        b[0].subresourceRange.layerCount = 1;
+        memset(&dep, 0, sizeof(dep));
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = b;
+        VK_CALL(vkCmdPipelineBarrier2(vk_cmd, &dep));
+
+        memset(&region, 0, sizeof(region));
+        region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
+        region.bufferOffset = (VkDeviceSize)n * PROTON_RT_SLOT_BYTES;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageOffset.x = ox;
+        region.imageOffset.y = oy;
+        region.imageExtent.width = (w < PROTON_RT_SAMPLE_W) ? w : PROTON_RT_SAMPLE_W;
+        region.imageExtent.height = (h < PROTON_RT_SAMPLE_H) ? h : PROTON_RT_SAMPLE_H;
+        region.imageExtent.depth = 1;
+        memset(&copy_info, 0, sizeof(copy_info));
+        copy_info.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2;
+        copy_info.srcImage = img;
+        copy_info.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        copy_info.dstBuffer = s_rt_scan.buffer;
+        copy_info.regionCount = 1;
+        copy_info.pRegions = &region;
+        VK_CALL(vkCmdCopyImageToBuffer2(vk_cmd, &copy_info));
+
+        /* restore TRANSFER_SRC -> common_layout */
+        b[0].srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        b[0].srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        b[0].dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b[0].dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+        b[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b[0].newLayout = common;
+        VK_CALL(vkCmdPipelineBarrier2(vk_cmd, &dep));
+
+        s_rt_scan.pending[n].w = w;
+        s_rt_scan.pending[n].h = h;
+        s_rt_scan.pending[n].fmt = s_rt_entries[i].vk_format;
+        s_rt_scan.pending[n].layout = (int)common;
+        {
+            int k, is_bb = 0;
+            for (k = 0; k < (int)ARRAY_SIZE(chain->user.backbuffers); ++k)
+                if (chain->user.backbuffers[k] == res) { is_bb = 1; break; }
+            s_rt_scan.pending[n].is_bb = is_bb;
+        }
+        ++n;
+    }
+    pthread_mutex_unlock(&s_rt_scan_lock);
+    s_rt_scan.pending_n = n;
+    s_rt_scan.pending_seq = seq;
+}
+
+static void proton_rt_scan_readback(uint32_t seq)
+{
+    int i;
+    if (!s_rt_scan.inited || s_rt_scan.pending_seq != seq || s_rt_scan.pending_n == 0) return;
+    for (i = 0; i < s_rt_scan.pending_n; ++i)
+    {
+        const uint8_t *p = (const uint8_t*)s_rt_scan.mapped + (size_t)i * PROTON_RT_SLOT_BYTES;
+        /* Count nonzero-RGB pixels (4-byte RGBA/BGRA stride), IGNORING alpha — opaque
+         * black (000000ff) must read as black, not content. Accurate for 4-byte color
+         * RTs (fmt 37/44, incl the scene+backbuffer); approximate for wider formats. */
+        uint32_t nzrgb = 0, px, maxv = 0;
+        for (px = 0; px < PROTON_RT_SAMPLE_W * PROTON_RT_SAMPLE_H; ++px)
+        {
+            uint8_t r = p[px*4 + 0], g = p[px*4 + 1], b = p[px*4 + 2];
+            if (r | g | b) ++nzrgb;
+            if (r > maxv) maxv = r;
+            if (g > maxv) maxv = g;
+            if (b > maxv) maxv = b;
+        }
+        INFO("[RT-SCAN] seq=%u rt=%d %ux%u fmt=%d layout=%d%s nonzeroRGB=%u/%u maxRGB=%u %s\n",
+             seq, i, s_rt_scan.pending[i].w, s_rt_scan.pending[i].h, s_rt_scan.pending[i].fmt,
+             s_rt_scan.pending[i].layout, s_rt_scan.pending[i].is_bb ? " BACKBUFFER" : "",
+             nzrgb, (unsigned)(PROTON_RT_SAMPLE_W*PROTON_RT_SAMPLE_H), maxv,
+             nzrgb ? "HAS-CONTENT" : "black");
+    }
+    s_rt_scan.pending_seq = 0;
+    s_rt_scan.pending_n = 0;
+}
+
 static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *chain, VkCommandBuffer vk_cmd, uint32_t swapchain_index)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
@@ -2477,6 +2747,32 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
             uint32_t w = (bw >= PROTON_BB_SAMPLE_W) ? PROTON_BB_SAMPLE_W : bw;
             uint32_t h = (bh >= PROTON_BB_SAMPLE_H) ? PROTON_BB_SAMPLE_H : bh;
 
+            /* [BB-SCAN] PROTON_VKD3D_BB_SCAN=1: sweep the 32x32 window across the
+             * WHOLE frame over successive samples (grid walk) instead of fixed
+             * center. Reveals off-center content (e.g. menu UI) so we can tell
+             * "KK backbuffer truly black" from "KK renders content somewhere".
+             * Each sample logs its (ox,oy); correlate seq with [BB-SAMPLE]. */
+            {
+                static int cached_scan = -1;
+                if (cached_scan < 0) {
+                    const char *v = getenv("PROTON_VKD3D_BB_SCAN");
+                    cached_scan = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+                }
+                if (cached_scan && bw > PROTON_BB_SAMPLE_W && bh > PROTON_BB_SAMPLE_H) {
+                    static uint32_t s_scan_idx = 0;
+                    uint32_t gx = bw / PROTON_BB_SAMPLE_W;
+                    uint32_t gy = bh / PROTON_BB_SAMPLE_H;
+                    uint32_t cells = gx * gy;
+                    uint32_t cell = (cells > 0) ? (s_scan_idx++ % cells) : 0;
+                    ox = (int32_t)((cell % gx) * PROTON_BB_SAMPLE_W);
+                    oy = (int32_t)((cell / gx) * PROTON_BB_SAMPLE_H);
+                    w = PROTON_BB_SAMPLE_W;
+                    h = PROTON_BB_SAMPLE_H;
+                    INFO("[BB-SCAN] seq=%u ox=%d oy=%d (grid %ux%u cell=%u/%u)\n",
+                         n, ox, oy, gx, gy, cell, cells);
+                }
+            }
+
             if (!s_bb_sample.format_logged)
             {
                 INFO("[BB-SAMPLE] user_backbuffer vk_format=%d backbuffer=%ux%u sample=%ux%u@(%d,%d)\n",
@@ -2506,6 +2802,8 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
             s_bb_sample.pending_seq = n;
             /* timeline value set by submit_blit after vkQueueSubmit2 increments internal_blit_count */
             s_bb_sample.pending_timeline = chain->present.internal_blit_count + 1;
+            /* [RT-SCAN] also sample all registered large color RTs this frame */
+            proton_rt_scan_record(chain, vk_cmd, n);
         }
     }
 
@@ -2834,6 +3132,8 @@ static bool dxgi_vk_swap_chain_submit_blit(struct dxgi_vk_swap_chain *chain, uin
                  p[(total-1)*4 + 0], p[(total-1)*4 + 1], p[(total-1)*4 + 2], p[(total-1)*4 + 3]);
             (void)wait_value;
         }
+        /* [RT-SCAN] the drain above covered our RT copies (same present cmd buf) */
+        proton_rt_scan_readback(seq);
     }
 
     return vr == VK_SUCCESS;
