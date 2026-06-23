@@ -1644,6 +1644,15 @@ static HRESULT vkd3d_memory_chunk_allocate_range(struct vkd3d_memory_chunk *chun
             memory_requirements->size);
     allocation->chunk = chunk;
 
+#if 1 /* proton-darwin pool-gated-recycle */
+    /* proton-darwin pool-gated-recycle: this chunk just absorbed an
+     * allocation, so it is no longer idle. Clearing the timestamp ensures
+     * the next evict_idle_chunks sweep skips it even if the chunk goes
+     * empty again. The submit-snapshot is left stale -- it's only read
+     * when last_empty_at_ns != 0. */
+    chunk->last_empty_at_ns = 0;
+#endif
+
     /* Remove allocated range from the free list */
     l_length = allocation->offset - pick_range->offset;
     r_length = pick_range->offset + pick_range->length
@@ -1809,6 +1818,307 @@ static void vkd3d_memory_allocator_remove_chunk(struct vkd3d_memory_allocator *a
     vkd3d_memory_chunk_destroy(chunk, device, allocator);
 }
 
+#if 1 /* proton-darwin pool-gated-recycle */
+/* proton-darwin pool-gated-recycle: defer eviction of fully-empty chunks
+ * for UPLOAD/READBACK pools (default) to absorb CryEngine staging churn
+ * on macOS, where MoltenVK's MVKDeviceMemory::ensureHostMemory backs each
+ * allocation with posix_memalign and dirty pages remain resident for the
+ * life of the process even after vkFreeMemory.
+ *
+ * This is a refinement over the original 0008-macos-chunk-recycle:
+ *
+ *   (a) Pool-gate. Only the heap types in recycle_pool_mask are recycled.
+ *       Default mask is UPLOAD|READBACK so DEFAULT-heap chunks continue
+ *       to take the immediate-evict path (sidesteps an FSR2 UAF that the
+ *       unconditional recycle exposed in CryEngine).
+ *
+ *   (b) Fence-quiesce. When a chunk transitions to fully-empty we capture
+ *       a snapshot of submission_timeline_count across every queue. The
+ *       chunk is only evicted once all queues have signalled past that
+ *       snapshot (non-blocking poll via vkGetSemaphoreCounterValue). This
+ *       guards the case where a command list referencing the chunk's
+ *       VkBuffer is still in flight when the application releases the
+ *       suballocation. */
+
+#define VKD3D_CHUNK_RECYCLE_EVICT_CAP_PER_CALL 16
+#define VKD3D_CHUNK_RECYCLE_DEFAULT_IDLE_SECONDS 5
+#define VKD3D_CHUNK_RECYCLE_POOL_BIT_UPLOAD     0x1u
+#define VKD3D_CHUNK_RECYCLE_POOL_BIT_READBACK   0x2u
+#define VKD3D_CHUNK_RECYCLE_POOL_BIT_DEFAULT    0x4u
+#define VKD3D_CHUNK_RECYCLE_POOL_BIT_GPU_UPLOAD 0x8u
+#define VKD3D_CHUNK_RECYCLE_DEFAULT_POOL_MASK \
+        (VKD3D_CHUNK_RECYCLE_POOL_BIT_UPLOAD | VKD3D_CHUNK_RECYCLE_POOL_BIT_READBACK)
+
+static uint32_t vkd3d_memory_chunk_recycle_pool_bit(D3D12_HEAP_TYPE heap)
+{
+    switch (heap)
+    {
+        case D3D12_HEAP_TYPE_UPLOAD:     return VKD3D_CHUNK_RECYCLE_POOL_BIT_UPLOAD;
+        case D3D12_HEAP_TYPE_READBACK:   return VKD3D_CHUNK_RECYCLE_POOL_BIT_READBACK;
+        case D3D12_HEAP_TYPE_DEFAULT:    return VKD3D_CHUNK_RECYCLE_POOL_BIT_DEFAULT;
+        case D3D12_HEAP_TYPE_GPU_UPLOAD: return VKD3D_CHUNK_RECYCLE_POOL_BIT_GPU_UPLOAD;
+        default: return 0u;
+    }
+}
+
+static uint32_t vkd3d_memory_recycle_parse_pool_mask(const char *value)
+{
+    /* Comma-separated tokens, case-insensitive. Whitespace tolerated.
+     * Tokens: upload, readback, default, gpu_upload.
+     * Empty/NULL/all-whitespace -> default mask. */
+    uint32_t mask = 0u;
+    size_t start, end, len, i;
+    char token[32];
+    bool saw_any;
+
+    if (!value)
+        return VKD3D_CHUNK_RECYCLE_DEFAULT_POOL_MASK;
+
+    saw_any = false;
+    start = 0;
+    while (true)
+    {
+        /* Skip leading whitespace. */
+        while (value[start] == ' ' || value[start] == '\t')
+            start++;
+
+        end = start;
+        while (value[end] != '\0' && value[end] != ',')
+            end++;
+
+        /* Trim trailing whitespace from token. */
+        len = end - start;
+        while (len > 0 && (value[start + len - 1] == ' ' || value[start + len - 1] == '\t'))
+            len--;
+
+        if (len > 0 && len < sizeof(token))
+        {
+            for (i = 0; i < len; i++)
+            {
+                char c = value[start + i];
+                if (c >= 'A' && c <= 'Z')
+                    c = (char)(c - 'A' + 'a');
+                token[i] = c;
+            }
+            token[len] = '\0';
+            saw_any = true;
+
+            if (!strcmp(token, "upload"))
+                mask |= VKD3D_CHUNK_RECYCLE_POOL_BIT_UPLOAD;
+            else if (!strcmp(token, "readback"))
+                mask |= VKD3D_CHUNK_RECYCLE_POOL_BIT_READBACK;
+            else if (!strcmp(token, "default"))
+                mask |= VKD3D_CHUNK_RECYCLE_POOL_BIT_DEFAULT;
+            else if (!strcmp(token, "gpu_upload"))
+                mask |= VKD3D_CHUNK_RECYCLE_POOL_BIT_GPU_UPLOAD;
+            /* Unknown tokens are silently ignored to keep recipe edits forward-compatible. */
+        }
+
+        if (value[end] == '\0')
+            break;
+        start = end + 1;
+    }
+
+    return saw_any ? mask : VKD3D_CHUNK_RECYCLE_DEFAULT_POOL_MASK;
+}
+
+static void vkd3d_memory_allocator_load_recycle_config(struct vkd3d_memory_allocator *allocator)
+{
+    /* Caller holds allocator->mutex. */
+    char env[128];
+    unsigned long idle_seconds;
+
+    if (allocator->recycle_config_loaded)
+        return;
+
+    allocator->recycle_enabled = false;
+    allocator->recycle_idle_ns = (uint64_t)VKD3D_CHUNK_RECYCLE_DEFAULT_IDLE_SECONDS * 1000000000ull;
+    allocator->recycle_pool_mask = VKD3D_CHUNK_RECYCLE_DEFAULT_POOL_MASK;
+
+    if (vkd3d_get_env_var("VKD3D_ENABLE_CHUNK_RECYCLE", env, sizeof(env)) && !strcmp(env, "1"))
+        allocator->recycle_enabled = true;
+
+    if (vkd3d_get_env_var("VKD3D_CHUNK_IDLE_EVICT_SECONDS", env, sizeof(env)))
+    {
+        idle_seconds = strtoul(env, NULL, 0);
+        if (idle_seconds >= 1 && idle_seconds <= 600)
+            allocator->recycle_idle_ns = (uint64_t)idle_seconds * 1000000000ull;
+    }
+
+    if (vkd3d_get_env_var("VKD3D_CHUNK_RECYCLE_POOLS", env, sizeof(env)))
+        allocator->recycle_pool_mask = vkd3d_memory_recycle_parse_pool_mask(env);
+
+    if (allocator->recycle_enabled)
+    {
+        INFO("vkd3d chunk-recycle enabled (pool-gated), idle-evict threshold = %"PRIu64" s, pool_mask = 0x%x.\n",
+                allocator->recycle_idle_ns / 1000000000ull,
+                allocator->recycle_pool_mask);
+    }
+
+    allocator->recycle_config_loaded = true;
+}
+
+static bool vkd3d_memory_allocator_recycle_enabled(struct vkd3d_memory_allocator *allocator)
+{
+    /* Caller holds allocator->mutex. */
+    vkd3d_memory_allocator_load_recycle_config(allocator);
+    return allocator->recycle_enabled;
+}
+
+static bool vkd3d_memory_allocator_recycle_pool(struct vkd3d_memory_allocator *allocator,
+        D3D12_HEAP_TYPE heap)
+{
+    /* Caller holds allocator->mutex and has already verified recycle_enabled. */
+    uint32_t bit = vkd3d_memory_chunk_recycle_pool_bit(heap);
+    return bit != 0u && (allocator->recycle_pool_mask & bit) != 0u;
+}
+
+/* Snapshot the highest submitted submission_timeline_count across every
+ * queue (including out_of_band_queue if present). Padded by +1 per queue
+ * to cover the case where the last consumer was a semaphore-only signal
+ * with no work in between. CPU-side counter read without queue lock --
+ * it's a monotonic upper bound that may briefly trail a concurrent bump,
+ * which only delays eviction, never reclaims an in-flight chunk. */
+static uint64_t vkd3d_snapshot_all_queues_submit(struct d3d12_device *device)
+{
+    struct vkd3d_queue_family_info *family;
+    uint64_t snapshot = 0;
+    uint32_t i, j;
+
+    for (i = 0; i < VKD3D_QUEUE_FAMILY_COUNT; i++)
+    {
+        family = device->queue_families[i];
+        if (!family)
+            continue;
+
+        for (j = 0; j < family->queue_count; j++)
+        {
+            if (!family->queues[j])
+                continue;
+            snapshot += family->queues[j]->submission_timeline_count + 1ull;
+        }
+
+        if (family->out_of_band_queue)
+            snapshot += family->out_of_band_queue->submission_timeline_count + 1ull;
+    }
+
+    return snapshot;
+}
+
+/* Non-blocking poll: return true iff every queue has signalled past the
+ * snapshot value. On any vkGetSemaphoreCounterValue failure, return false
+ * (treat as not-yet-advanced to be safe). */
+static bool vkd3d_all_queues_advanced_past(struct d3d12_device *device, uint64_t snapshot)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    struct vkd3d_queue_family_info *family;
+    uint64_t signalled_sum = 0;
+    uint64_t signalled;
+    uint32_t i, j;
+    VkResult vr;
+
+    for (i = 0; i < VKD3D_QUEUE_FAMILY_COUNT; i++)
+    {
+        family = device->queue_families[i];
+        if (!family)
+            continue;
+
+        for (j = 0; j < family->queue_count; j++)
+        {
+            if (!family->queues[j])
+                continue;
+            signalled = 0;
+            vr = VK_CALL(vkGetSemaphoreCounterValue(device->vk_device,
+                    family->queues[j]->submission_timeline, &signalled));
+            if (vr < 0)
+                return false;
+            signalled_sum += signalled + 1ull;
+        }
+
+        if (family->out_of_band_queue)
+        {
+            signalled = 0;
+            vr = VK_CALL(vkGetSemaphoreCounterValue(device->vk_device,
+                    family->out_of_band_queue->submission_timeline, &signalled));
+            if (vr < 0)
+                return false;
+            signalled_sum += signalled + 1ull;
+        }
+    }
+
+    return signalled_sum >= snapshot;
+}
+
+/* Evict up to VKD3D_CHUNK_RECYCLE_EVICT_CAP_PER_CALL chunks that have been
+ * fully-empty for >= allocator->recycle_idle_ns AND have had every queue
+ * signal past their last_empty_at_submit_value snapshot. Caller holds
+ * allocator->mutex. Exposed (non-static) so external tooling (nm) can
+ * confirm the binary really shipped with the recycle code. */
+size_t vkd3d_memory_evict_idle_chunks(struct vkd3d_memory_allocator *allocator,
+        struct d3d12_device *device)
+{
+    struct vkd3d_memory_chunk *chunk;
+    uint64_t now_ns, idle_ns;
+    size_t evicted = 0;
+    uint32_t bit;
+    size_t i;
+
+    if (!allocator->recycle_enabled)
+        return 0;
+
+    idle_ns = allocator->recycle_idle_ns;
+    now_ns = vkd3d_get_current_time_ns();
+
+    /* Iterate in reverse so swap-remove (used by remove_chunk) does not
+     * break the walk: when we evict index i, the swap pulls the tail
+     * chunk into i, but we're already past i on the way down. */
+    i = allocator->chunks_count;
+    while (i-- > 0 && evicted < VKD3D_CHUNK_RECYCLE_EVICT_CAP_PER_CALL)
+    {
+        chunk = allocator->chunks[i];
+
+        if (chunk->last_empty_at_ns == 0)
+            continue;
+
+        bit = vkd3d_memory_chunk_recycle_pool_bit(chunk->allocation.heap_type);
+        if (!(allocator->recycle_pool_mask & bit))
+        {
+            /* Defensive: a chunk in a non-recycled pool should never carry
+             * a stamp (the free-path gates on the same mask), but if it
+             * does, clear the stamp so we don't loop on it. */
+            chunk->last_empty_at_ns = 0;
+            continue;
+        }
+
+        if (!vkd3d_memory_chunk_is_free(chunk))
+        {
+            /* Defensive: empty timestamp set but chunk re-acquired since. */
+            chunk->last_empty_at_ns = 0;
+            continue;
+        }
+
+        if (now_ns - chunk->last_empty_at_ns < idle_ns)
+            continue;
+
+        if (!vkd3d_all_queues_advanced_past(device, chunk->last_empty_at_submit_value))
+        {
+            TRACE("Chunk %p idle but fence-quiesce not satisfied (snapshot %"PRIu64").\n",
+                    chunk, chunk->last_empty_at_submit_value);
+            continue;
+        }
+
+        TRACE("Evicting idle chunk %p (heap_type %d, size %"PRIu64", idle %"PRIu64" ms, fence-quiesce ok).\n",
+                chunk, (int)chunk->allocation.heap_type,
+                chunk->allocation.resource.size,
+                (now_ns - chunk->last_empty_at_ns) / 1000000ull);
+        vkd3d_memory_allocator_remove_chunk(allocator, device, chunk);
+        evicted++;
+    }
+
+    return evicted;
+}
+#endif
+
 HRESULT vkd3d_memory_allocator_init(struct vkd3d_memory_allocator *allocator, struct d3d12_device *device)
 {
     int rc;
@@ -1873,6 +2183,16 @@ static HRESULT vkd3d_memory_allocator_try_add_chunk(struct vkd3d_memory_allocato
         alloc_info.flags |= VKD3D_ALLOCATION_FLAG_GLOBAL_BUFFER;
         alloc_info.explicit_global_buffer_usage = explicit_global_buffer_usage;
     }
+
+#if 1 /* proton-darwin pool-gated-recycle */
+    /* proton-darwin pool-gated-recycle: before growing the pool, give any
+     * eligible chunks (recycled pool, idle past threshold, all queues
+     * advanced past their empty-stamp snapshot) back to Vulkan. Bounded
+     * sweep, runs only on the slow path (we're about to vkAllocateMemory
+     * anyway). */
+    if (vkd3d_memory_allocator_recycle_enabled(allocator))
+        vkd3d_memory_evict_idle_chunks(allocator, device);
+#endif
 
     if (!vkd3d_array_reserve((void**)&allocator->chunks, &allocator->chunks_size,
             allocator->chunks_count + 1, sizeof(*allocator->chunks)))
@@ -1954,7 +2274,32 @@ void vkd3d_free_memory(struct d3d12_device *device, struct vkd3d_memory_allocato
         vkd3d_memory_chunk_free_range(allocation->chunk, allocation);
 
         if (vkd3d_memory_chunk_is_free(allocation->chunk))
+        {
+#if 1 /* proton-darwin pool-gated-recycle */
+            /* proton-darwin pool-gated-recycle: only chunks in pools listed
+             * in recycle_pool_mask are deferred. Non-recycled pools take
+             * the immediate-evict path the upstream code already used --
+             * this preserves FSR2-style producer/consumer release ordering
+             * for DEFAULT-heap chunks. */
+            if (vkd3d_memory_allocator_recycle_enabled(allocator) &&
+                    vkd3d_memory_allocator_recycle_pool(allocator,
+                            allocation->chunk->allocation.heap_type))
+            {
+                allocation->chunk->last_empty_at_ns = vkd3d_get_current_time_ns();
+                allocation->chunk->last_empty_at_submit_value =
+                        vkd3d_snapshot_all_queues_submit(device);
+                TRACE("vkd3d fence-quiesce snapshot: chunk %p heap_type %d snap %"PRIu64".\n",
+                        allocation->chunk, (int)allocation->chunk->allocation.heap_type,
+                        allocation->chunk->last_empty_at_submit_value);
+            }
+            else
+            {
+                vkd3d_memory_allocator_remove_chunk(allocator, device, allocation->chunk);
+            }
+#else
             vkd3d_memory_allocator_remove_chunk(allocator, device, allocation->chunk);
+#endif
+        }
         pthread_mutex_unlock(&allocator->mutex);
     }
     else
