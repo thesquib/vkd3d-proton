@@ -910,6 +910,21 @@ struct vkd3d_memory_chunk
     struct vkd3d_memory_free_range *free_ranges;
     size_t free_ranges_size;
     size_t free_ranges_count;
+#if 1 /* proton-darwin pool-gated-recycle */
+    /* proton-darwin pool-gated-recycle: timestamp (ns, CLOCK_MONOTONIC_RAW)
+     * of when this chunk most recently transitioned to fully-empty. Zero
+     * means the chunk is currently in use (has at least one live
+     * suballocation). When the chunk-recycle feature is enabled AND the
+     * chunk's heap type is listed in recycle_pool_mask, an empty chunk is
+     * kept on the chunks list instead of being freed immediately, so we
+     * can reuse it for the next allocation that fits, or evict it after
+     * (a) the idle threshold elapses and (b) every queue has signalled
+     * past last_empty_at_submit_value. */
+    uint64_t last_empty_at_ns;
+    /* Snapshot of sum(queue->submission_timeline_count + 1) across every
+     * queue at the moment last_empty_at_ns was stamped. */
+    uint64_t last_empty_at_submit_value;
+#endif
 };
 
 #define VKD3D_MEMORY_TRANSFER_COMMAND_BUFFER_COUNT (16u)
@@ -996,6 +1011,19 @@ struct vkd3d_memory_allocator
      * their VAs remain valid longer than they should. */
     struct d3d12_resource *sparse_pending_destroy[32];
     uint32_t sparse_pending_destroy_count;
+
+#if 1 /* proton-darwin pool-gated-recycle */
+    /* proton-darwin pool-gated-recycle config (cached env on first lookup,
+     * under allocator->mutex). */
+    bool recycle_config_loaded;
+    bool recycle_enabled;
+    uint64_t recycle_idle_ns;
+    /* Bitfield: bit 0 = UPLOAD, bit 1 = READBACK, bit 2 = DEFAULT,
+     * bit 3 = GPU_UPLOAD. Default (env unset/empty) = UPLOAD|READBACK
+     * (0x3). Other heap types take the upstream immediate-evict path
+     * unconditionally. */
+    uint32_t recycle_pool_mask;
+#endif
 };
 
 void vkd3d_free_memory(struct d3d12_device *device, struct vkd3d_memory_allocator *allocator,
@@ -1239,6 +1267,10 @@ ULONG d3d12_resource_decref(struct d3d12_resource *resource);
 
 HRESULT d3d12_resource_validate_heap_properties(const D3D12_RESOURCE_DESC1 *desc,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_RESOURCE_STATES initial_state);
+
+/* [RT-SCAN] diagnostic (PROTON_VKD3D_RT_SCAN=1): defined in swapchain.c */
+void proton_vkd3d_rt_scan_register(struct d3d12_resource *resource);
+void proton_vkd3d_rt_scan_unregister(struct d3d12_resource *resource);
 
 struct vkd3d_cookie vkd3d_allocate_cookie(void);
 UINT vkd3d_allocate_cookie_va_timestamp(void);
