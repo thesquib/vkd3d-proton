@@ -15825,6 +15825,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearDepthStencilView(d3d12_com
     if (flags & D3D12_CLEAR_FLAG_STENCIL)
         clear_aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
 
+    if (!dsv_desc->resource || !dsv_desc->view || !dsv_desc->format)
+    {
+        WARN("Ignoring ClearDepthStencilView on null DSV descriptor %p.\n", dsv_desc);
+        return;
+    }
+
     clear_aspects &= dsv_desc->format->vk_aspect_mask;
 
     if (!clear_aspects)
@@ -15952,6 +15958,17 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearRenderTargetView(d3d12_com
     d3d12_command_list_flush_dgc_batch(list);
 
     list->cmd.estimated_cost += VKD3D_COMMAND_COST_LOW;
+
+    /* A null RTV (created with resource == NULL, or a descriptor the app never wrote)
+     * has no view or format. Real drivers treat clearing one as a no-op, and
+     * OMSetRenderTargets already tolerates binding one; do the same here instead
+     * of dereferencing NULL. Seen with KCD2, which created RTVs for NULL back
+     * buffers after a DXGI-layer ResizeBuffers failure. */
+    if (!rtv_desc->resource || !rtv_desc->view || !rtv_desc->format)
+    {
+        WARN("Ignoring ClearRenderTargetView on null RTV descriptor %p.\n", rtv_desc);
+        return;
+    }
 
     if (rtv_desc->format->type == VKD3D_FORMAT_TYPE_UINT)
     {
