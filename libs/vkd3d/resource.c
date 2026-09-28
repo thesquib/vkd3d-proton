@@ -4721,10 +4721,35 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
 
     if (heap_offset & (object->placed_alignment - 1u))
     {
-        WARN("Heap offset %#"PRIx64" not a multiple of resource alignment %#"PRIx64".\n",
-                heap_offset, object->placed_alignment);
-        hr = E_INVALIDARG;
-        goto fail;
+        /* proton-darwin 2026-09-28: Dune: Awakening places a 1x1 RGBA16F render
+         * target (Alignment 64K, no tight-alignment flag) at heap offset 32K, and
+         * works on Windows drivers and on the Deck. For textures, the code below
+         * aligns the offset up to the Vulkan image requirement and fails if that
+         * overruns the heap, so accepting a D3D12-misaligned offset stays safe for
+         * the binding. Dune packs buffers the same way (a 256 KB UAV buffer at
+         * 32K); a placed buffer is a slice of the heap allocation, valid at any
+         * VKD3D_MIN_BUFFER_ALIGNMENT multiple (what tight-aligned buffers use). */
+        if (d3d12_resource_is_texture(object) || !(heap_offset & (VKD3D_MIN_BUFFER_ALIGNMENT - 1u)))
+        {
+            /* Dune hits this ~600 times a second in gameplay: log the first few, then every 4096th. */
+            static uint32_t allowed_count;
+            uint32_t count = vkd3d_atomic_uint32_increment(&allowed_count, vkd3d_memory_order_relaxed);
+            if (count <= 16 || !(count & 4095))
+                WARN("(%u) Heap offset %#"PRIx64" not a multiple of resource alignment %#"PRIx64" (dim %u, %"PRIu64" x %u, fmt #%x, flags #%x), allowing.\n",
+                        count, heap_offset, object->placed_alignment, desc->Dimension, desc->Width, desc->Height,
+                        desc->Format, desc->Flags);
+        }
+        else
+        {
+            WARN("Heap offset %#"PRIx64" not a multiple of resource alignment %#"PRIx64".\n",
+                    heap_offset, object->placed_alignment);
+            WARN("  desc: dim %u, %"PRIu64" x %u x %u, %u levels, %u samples, fmt #%x, flags #%x, desc align %#"PRIx64", resolved align %#"PRIx64"; heap align %#"PRIx64" flags #%x size %#"PRIx64".\n",
+                    desc->Dimension, desc->Width, desc->Height, desc->DepthOrArraySize, desc->MipLevels,
+                    desc->SampleDesc.Count, desc->Format, desc->Flags, desc->Alignment, object->desc.Alignment,
+                    heap->desc.Alignment, heap->desc.Flags, heap->desc.SizeInBytes);
+            hr = E_INVALIDARG;
+            goto fail;
+        }
     }
 
     if (d3d12_resource_is_texture(object))
