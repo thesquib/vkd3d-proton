@@ -4939,6 +4939,16 @@ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
     struct d3d12_resource *object;
     HRESULT hr;
 
+    /* Without tiled resource support there is no sparse binding queue to run tile mapping
+     * updates on (internal_sparse_queue stays NULL), so every reserved resource has to be
+     * a committed fallback, which UpdateTileMappings and CopyTileMappings ignore. */
+    if (!device->d3d12_caps.options.TiledResourcesTier)
+    {
+        FIXME_ONCE("Tiled resources are not supported, falling back to committed resources. VRAM bloat expected.\n");
+        return d3d12_resource_create_reserved_fallback(device, desc, initial_state,
+                optimized_clear_value, num_castable_formats, castable_formats, resource);
+    }
+
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
     {
         format = vkd3d_get_format(device, desc->Format, !!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
