@@ -4943,12 +4943,13 @@ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
     struct d3d12_resource *object;
     HRESULT hr;
 
-    /* Without tiled resource support there is no sparse binding queue to run tile mapping
-     * updates on (internal_sparse_queue stays NULL), so every reserved resource has to be
-     * a committed fallback, which UpdateTileMappings and CopyTileMappings ignore. */
-    if (!device->d3d12_caps.options.TiledResourcesTier)
+    /* Without a sparse binding queue there is nothing to run tile mapping updates on, so every
+     * reserved resource has to be a committed fallback, which UpdateTileMappings and
+     * CopyTileMappings ignore. Checked on the queue, not TiledResourcesTier: a VKD3D_FEATURE_LEVEL
+     * override raises the reported tier on devices without sparse support. */
+    if (!device->internal_sparse_queue)
     {
-        FIXME_ONCE("Tiled resources are not supported, falling back to committed resources. VRAM bloat expected.\n");
+        FIXME_ONCE("No sparse binding queue, falling back to committed resources. VRAM bloat expected.\n");
         return d3d12_resource_create_reserved_fallback(device, desc, initial_state,
                 optimized_clear_value, num_castable_formats, castable_formats, resource);
     }
