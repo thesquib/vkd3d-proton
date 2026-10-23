@@ -23695,6 +23695,13 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_CopyTileMappings(ID3D12CommandQueue 
             iface, dst_resource, dst_region_start_coordinate, src_resource,
             src_region_start_coordinate, region_size, flags);
 
+    /* Either can be a fallback sparse resource, which has no tile mappings to copy. */
+    if (!(dst_res->flags & VKD3D_RESOURCE_RESERVED) || !(src_res->flags & VKD3D_RESOURCE_RESERVED))
+    {
+        WARN("Ignoring CopyTileMappings call on fallback reserved resource.\n");
+        return;
+    }
+
     sub.type = VKD3D_SUBMISSION_BIND_SPARSE;
     sub.bind_sparse.mode = VKD3D_SPARSE_MEMORY_BIND_MODE_COPY;
     sub.bind_sparse.bind_count = region_size->NumTiles;
