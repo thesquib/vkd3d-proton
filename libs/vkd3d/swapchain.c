@@ -1022,26 +1022,29 @@ static bool dxgi_vk_swap_chain_is_occluded(struct dxgi_vk_swap_chain *chain)
 }
 #endif
 
-static bool dxgi_vk_swap_chain_present_is_occluded(struct dxgi_vk_swap_chain *chain)
+static bool dxgi_vk_swap_chain_present_is_occluded(struct dxgi_vk_swap_chain *chain, UINT flags)
 {
 #ifdef _WIN32
-    if (dxgi_vk_swap_chain_present_task_is_idle(chain))
+    uint32_t occlusion_state = vkd3d_atomic_uint32_load_explicit(&chain->present.is_occlusion_state,
+            vkd3d_memory_order_relaxed);
+
+    /* If we are already occluded, or the app is explicitly testing for occlusion,
+     * query the surface directly when the present task is idle to detect state changes.
+     * In the steady non-occluded state, rely on observed behavior from the presentation thread
+     * to avoid an expensive vkGetPhysicalDeviceSurfaceCapabilitiesKHR roundtrip on every present. */
+    if ((occlusion_state || (flags & DXGI_PRESENT_TEST)) && dxgi_vk_swap_chain_present_task_is_idle(chain))
     {
-        /* Query the surface directly. */
-        chain->present.is_occlusion_state = dxgi_vk_swap_chain_is_occluded(chain);
-        return chain->present.is_occlusion_state != 0;
+        occlusion_state = dxgi_vk_swap_chain_is_occluded(chain);
+        vkd3d_atomic_uint32_store_explicit(&chain->present.is_occlusion_state, occlusion_state,
+                vkd3d_memory_order_relaxed);
     }
-    else
-    {
-        /* If presentation requests are pending it is not safe to access the surface directly
-         * without adding tons of locks everywhere,
-         * so rely on observed behavior from presentation thread. */
-        return vkd3d_atomic_uint32_load_explicit(&chain->present.is_occlusion_state, vkd3d_memory_order_relaxed) != 0;
-    }
+
+    return occlusion_state != 0;
 #else
-	/* Irrelevant on native build. */
-	(void)chain;
-	return false;
+    /* Irrelevant on native build. */
+    (void)chain;
+    (void)flags;
+    return false;
 #endif
 }
 
@@ -1126,7 +1129,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
             iface, SyncInterval, PresentFlags, pPresentParameters);
     (void)pPresentParameters;
 
-    if (dxgi_vk_swap_chain_present_is_occluded(chain))
+    if (dxgi_vk_swap_chain_present_is_occluded(chain, PresentFlags))
         return DXGI_STATUS_OCCLUDED;
     if (PresentFlags & DXGI_PRESENT_TEST)
         return S_OK;
@@ -1730,44 +1733,59 @@ static VkColorSpaceKHR convert_color_space(DXGI_COLOR_SPACE_TYPE dxgi_color_spac
     }
 }
 
-static bool dxgi_vk_swap_chain_accept_format(const VkSurfaceFormatKHR *format, VkFormat vk_format)
+static unsigned int get_present_format_bit_depth(VkFormat format)
 {
-    if (vk_format == VK_FORMAT_UNDEFINED)
+    switch (format)
     {
-        switch (format->format)
-        {
-            case VK_FORMAT_R8G8B8A8_UNORM:
-            case VK_FORMAT_B8G8R8A8_UNORM:
-            case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
-                return true;
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+            return 8;
 
-            default:
-                return false;
-        }
-    }
-    else
-    {
-        return format->format == vk_format;
+        case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+            return 10;
+
+        default:
+            return 0;
     }
 }
 
+/* Presentation blits or draws into the swapchain image, so if there is no exact match,
+ * any format with the same bit depth works regardless of channel order.
+ * Mesa on X11 at 30-bit color depth exposes only A2R10G10B10 while DXGI R10G10B10A2 maps to A2B10G10R10. */
 static bool dxgi_vk_swap_chain_find_surface_format(struct dxgi_vk_swap_chain *chain, VkFormat vk_format,
         VkColorSpaceKHR color_space, VkSurfaceFormatKHR *format)
 {
+    unsigned int bit_depth = get_present_format_bit_depth(vk_format);
+    const VkSurfaceFormatKHR *surface_format;
     bool ret = false;
     uint32_t i;
 
     pthread_mutex_lock(&chain->properties.lock);
     dxgi_vk_swap_chain_update_formats_locked(chain, false);
+
     for (i = 0; i < chain->properties.format_count && !ret; i++)
     {
-        if (dxgi_vk_swap_chain_accept_format(&chain->properties.formats[i], vk_format) &&
-                chain->properties.formats[i].colorSpace == color_space)
+        surface_format = &chain->properties.formats[i];
+        if (surface_format->colorSpace == color_space && surface_format->format == vk_format)
         {
-            *format = chain->properties.formats[i];
+            *format = *surface_format;
             ret = true;
         }
     }
+
+    for (i = 0; i < chain->properties.format_count && !ret; i++)
+    {
+        surface_format = &chain->properties.formats[i];
+        if (surface_format->colorSpace == color_space && bit_depth &&
+            get_present_format_bit_depth(surface_format->format) == bit_depth)
+        {
+            *format = *surface_format;
+            ret = true;
+        }
+    }
+
     pthread_mutex_unlock(&chain->properties.lock);
     return ret;
 }
@@ -1782,10 +1800,12 @@ static bool dxgi_vk_swap_chain_select_format(struct dxgi_vk_swap_chain *chain, V
 
     /* If we're using sRGB swapchains, we can fallback.
      * Usually happens for RGBA8 or 10-bit UNORM and display does not support it as a present format.
-     * This can be trivially worked around by selecting e.g. BGRA8. */
+     * This can be trivially worked around by selecting e.g. BGRA8.
+     * Mesa on X11 at 30-bit color depth exposes only A2B10G10R10 UNORM. */
     if (vk_color_space == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
     {
-        return dxgi_vk_swap_chain_find_surface_format(chain, VK_FORMAT_UNDEFINED, vk_color_space, format);
+        return dxgi_vk_swap_chain_find_surface_format(chain, VK_FORMAT_B8G8R8A8_UNORM, vk_color_space, format) ||
+                dxgi_vk_swap_chain_find_surface_format(chain, VK_FORMAT_A2B10G10R10_UNORM_PACK32, vk_color_space, format);
     }
     else
     {
@@ -3123,7 +3143,8 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
     if (vr < 0)
         dxgi_vk_swap_chain_destroy_swapchain_in_present_task(chain);
 
-    if (vr == VK_ERROR_OUT_OF_DATE_KHR)
+    /* Full timing queue should never happen, but if it does anyway ... */
+    if (vr == VK_ERROR_OUT_OF_DATE_KHR || vr == VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT)
     {
         if (retry_counter < 3)
             dxgi_vk_swap_chain_present_iteration(chain, present_count, retry_counter + 1);
@@ -3305,7 +3326,7 @@ static void dxgi_vk_swap_chain_update_past_presentation(struct dxgi_vk_swap_chai
         }
     }
 
-    delta = (int64_t)time - (int64_t)chain->timing.calibration[i][1];
+    delta = (int64_t)time - (int64_t)calibration[1];
 
 #ifdef _WIN32
     {
@@ -3315,7 +3336,7 @@ static void dxgi_vk_swap_chain_update_past_presentation(struct dxgi_vk_swap_chai
     }
 #endif
 
-    time = chain->timing.calibration[i][0] + delta;
+    time = calibration[0] + delta;
 
     if (present_count > chain->frame_statistics.count)
     {
@@ -3419,10 +3440,10 @@ static void dxgi_vk_swap_chain_update_frame_statistics(struct dxgi_vk_swap_chain
 {
     uint64_t time;
 
-    if (chain->present.timing)
+    if (chain->present.timing && present_id)
     {
         dxgi_vk_swap_chain_poll_past_presentation(chain);
-        if (chain->frame_statistics.count < present_count && present_id)
+        if (chain->frame_statistics.count < present_count)
         {
             /* Vulkan spec does not guarantee this, but it's unclear if we are allowed to
              * skip or arbitrarily delay reports in DXGI.
@@ -3893,6 +3914,10 @@ static HRESULT dxgi_vk_swap_chain_init(struct dxgi_vk_swap_chain *chain, IDXGIVk
 
     if (FAILED(hr = dxgi_vk_swap_chain_create_surface(chain, pFactory)))
         goto cleanup_common;
+
+#ifdef _WIN32
+    chain->present.is_occlusion_state = dxgi_vk_swap_chain_is_occluded(chain);
+#endif
 
     if (FAILED(hr = dxgi_vk_swap_chain_init_sync_objects(chain)))
         goto cleanup_surface;

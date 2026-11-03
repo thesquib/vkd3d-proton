@@ -34,7 +34,8 @@ enum vkd3d_application_feature_override
     VKD3D_APPLICATION_FEATURE_RDNA1_COMPATIBILITY = 1 << 5,
     VKD3D_APPLICATION_FEATURE_ASSUMES_STRICT_BYTE_ADDRESS_WRAP = 1 << 6,
     VKD3D_APPLICATION_FEATURE_BROKEN_WAVE128_REQUESTS = 1 << 7,
-    VKD3D_APPLICATION_FEATURE_REQUIRES_MIN16_DENORMS = 1 << 8
+    VKD3D_APPLICATION_FEATURE_REQUIRES_MIN16_DENORMS = 1 << 8,
+    VKD3D_APPLICATION_FEATURE_ATTEMPTS_COMPLEX_MULTIVIEW = 1 << 9,
 };
 
 static enum vkd3d_application_feature_override vkd3d_application_feature_override;
@@ -223,6 +224,8 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_EXACT, "teardown.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(.FAIL_UNSUPPORTED_STATE_TEMPLATE = 1) },
     /* NBA 2K27 (4356430) */
     { VKD3D_STRING_COMPARE_EXACT, "NBA2K27.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(.DESCRIPTOR_HEAP = 1) },
+    /* Space Engineers 2 (1133870) */
+    { VKD3D_STRING_COMPARE_EXACT, "SpaceEngineers2.exe", VKD3D_CONFIG_FLAGS_NONE, VKD3D_CONFIG_FLAGS_NONE, VKD3D_APPLICATION_FEATURE_ATTEMPTS_COMPLEX_MULTIVIEW },
     { VKD3D_STRING_COMPARE_NEVER, NULL },
 };
 
@@ -241,6 +244,8 @@ static const struct vkd3d_shader_quirk_hash ue4_hashes[] = {
     { NULL, 0xa48ead2a618e12d8ull, VKD3D_SHADER_QUIRK_FORCE_EXPLICIT_LOD_IN_CONTROL_FLOW },
     { NULL, 0xebfd864995d3fc07ull, VKD3D_SHADER_QUIRK_FORCE_EXPLICIT_LOD_IN_CONTROL_FLOW },
     { NULL, 0xcca7b582db60199cull, VKD3D_SHADER_QUIRK_FORCE_EXPLICIT_LOD_IN_CONTROL_FLOW },
+    /* RT glitches on AMD in multiple unrelated UE4 games are resolved with extra barriers added. */
+    { NULL, 0x80070f7c22fa9175ull, VKD3D_SHADER_QUIRK_FORCE_PRE_COMPUTE_BARRIER },
 };
 
 static const struct vkd3d_shader_quirk_info ue4_quirks = {
@@ -303,6 +308,9 @@ static const struct vkd3d_shader_quirk_hash mhr_hashes[] = {
      * There some places where catastrophic cancellation occurs
      * and one ULP difference is the difference between blown out bloom and not. */
     { NULL, 0xd892f8024f52d3ca, VKD3D_SHADER_QUIRK_FORCE_NOCONTRACT_MATH },
+    /* Compute shader reads groupshared memory without a barrier.
+     * Causes view-dependent flickering of instanced foliage, rocks and other environmental elements on NVIDIA. */
+    { NULL, 0xaae07660844b89cf, VKD3D_SHADER_QUIRK_FORCE_TGSM_BARRIERS },
 };
 
 static const struct vkd3d_shader_quirk_info mhr_quirks = {
@@ -606,6 +614,10 @@ static const struct vkd3d_shader_quirk_info half_sword_quirks = {
     NULL, 0, VKD3D_SHADER_QUIRK_CLAMP_WAVE_SIZE_TO_THREAD_GROUP32,
 };
 
+static const struct vkd3d_shader_quirk_info arc_raiders_quirks = {
+    NULL, 0, VKD3D_SHADER_QUIRK_CLAMP_WAVE_SIZE_TO_THREAD_GROUP32,
+};
+
 static const struct vkd3d_shader_quirk_hash ac8_hashes[] = {
     { "SkyTraceCS", 0, VKD3D_SHADER_QUIRK_FORCE_DENORM_LEGACY_FP16_CONVERSIONS },
 };
@@ -722,6 +734,8 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     { VKD3D_STRING_COMPARE_APPID, "1245620", &elden_ring_quirks },
     /* Half Sword (2397300) */
     { VKD3D_STRING_COMPARE_EXACT, "HalfSwordUE5-Win64-Shipping.exe", &half_sword_quirks },
+    /* ARC Raiders (1808500) */
+    { VKD3D_STRING_COMPARE_STARTS_WITH, "PioneerGame", &arc_raiders_quirks },
     /* ACE COMBAT 8 (2288340) */
     { VKD3D_STRING_COMPARE_APPID, "2288340", &ac8_quirks },
     /* Unreal Engine 4 */
@@ -950,6 +964,7 @@ void vkd3d_instance_apply_global_shader_quirks(void)
     static const struct override overrides[] =
     {
         { VKD3D_CONFIG_FLAG_STATIC(FORCE_NO_INVARIANT_POSITION), VKD3D_SHADER_QUIRK_INVARIANT_POSITION, true },
+        { VKD3D_CONFIG_FLAG_STATIC(DESCRIPTOR_HEAP_ROBUSTNESS), VKD3D_SHADER_QUIRK_DESCRIPTOR_HEAP_ROBUSTNESS, false },
     };
     bool eq_test;
     unsigned int i;
@@ -1193,6 +1208,11 @@ bool vkd3d_application_has_broken_wave128(void)
 bool vkd3d_application_requires_min16_denorms(void)
 {
     return (vkd3d_application_feature_override & VKD3D_APPLICATION_FEATURE_REQUIRES_MIN16_DENORMS) != 0;
+}
+
+bool vkd3d_application_attempts_complex_multiview(void)
+{
+    return (vkd3d_application_feature_override & VKD3D_APPLICATION_FEATURE_ATTEMPTS_COMPLEX_MULTIVIEW) != 0;
 }
 
 VKD3D_DEBUG_CONTROL_BEHAVIOR_FLAGS vkd3d_debug_control_get_behavior_flags(void);
