@@ -9961,10 +9961,14 @@ static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
          *   If minSize == maxSize, we are trivially guaranteed the desired wave size anyways.
          * - RayPayload attribute (purely metadata in DXIL land, irrelevant for us).
          */
+        /* KosmicKrisp: Metal has no buffer or groupshared 64-bit atomics (only non-returning min/max), so the feature
+         * stays false and OPTIONS9/11 stay 0. UE5 asks for SM 6.6 but uses typed non-returning 64-bit max, which KK
+         * implements; a shader using buffer/groupshared 64-bit atomics is still refused at pipeline creation. */
         if (device->d3d12_caps.max_shader_model == D3D_SHADER_MODEL_6_5 &&
                 (device->device_info.compute_shader_derivatives_features_khr.computeDerivativeGroupLinear ||
                         device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY) &&
-                device->device_info.vulkan_1_2_features.shaderBufferInt64Atomics &&
+                (device->device_info.vulkan_1_2_features.shaderBufferInt64Atomics ||
+                        device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_KOSMICKRISP) &&
                 device->device_info.vulkan_1_2_features.shaderInt8 &&
                 d3d12_device_supports_required_subgroup_size_for_stage(device, VK_SHADER_STAGE_COMPUTE_BIT))
         {
