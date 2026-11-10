@@ -70,7 +70,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_queue_vkd3d_ext_NotifyOutOfBandCo
 
     for (i = 0; i < VKD3D_QUEUE_FAMILY_COUNT; i++)
     {
-        if (command_queue->device->queue_families[i]->vk_family_index == command_queue->vkd3d_queue->vk_family_index &&
+        /* Optional queue-family slots may be NULL. */
+        if (command_queue->device->queue_families[i] &&
+                command_queue->device->queue_families[i]->vk_family_index == command_queue->vkd3d_queue->vk_family_index &&
                 command_queue->device->queue_families[i]->out_of_band_queue)
         {
             struct vkd3d_queue *out_of_band_queue = command_queue->device->queue_families[i]->out_of_band_queue;
