@@ -3577,8 +3577,10 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
      * has already been translated to SPIR-V (or loaded from cache) above, so
      * the deferred-compile path can resume from this point cheaply. We do NOT
      * create the VkShaderModule yet because that allocates driver memory we
-     * want to avoid in the "PSO created but never bound" case. */
-    if (state->lazy)
+     * want to avoid in the "PSO created but never bound" case. The deferred
+     * compile itself (status COMPILING, under compile_mutex) goes on. */
+    if (state->lazy && vkd3d_atomic_uint32_load_explicit(&state->lazy->status,
+            vkd3d_memory_order_relaxed) != VKD3D_LAZY_COMPILING)
     {
         (void)vk_cache;
         (void)feedbacks;
