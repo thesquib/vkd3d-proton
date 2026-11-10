@@ -3055,7 +3055,7 @@ struct vkd3d_queue_family_info *d3d12_device_get_vkd3d_queue_family(struct d3d12
     {
         for (int i = 0; i < VKD3D_QUEUE_FAMILY_COUNT; i++)
         {
-            if (device->queue_families[i]->vk_family_index == vk_family_index)
+            if (device->queue_families[i] && device->queue_families[i]->vk_family_index == vk_family_index)
                 return device->queue_families[i];
         }
         FIXME("Unhandled command list vk_family %#x.\n", vk_family_index);
